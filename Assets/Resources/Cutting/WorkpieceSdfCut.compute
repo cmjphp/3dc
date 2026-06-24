@@ -1,0 +1,389 @@
+#pragma kernel CutCapsuleSdf
+#pragma kernel CutProfileCutterSdf
+#pragma kernel InitializeBoxSdf
+#pragma kernel RemoveUnsupportedColumnsSdf
+
+RWStructuredBuffer<float> _SdfSamples;
+RWStructuredBuffer<int> _ChangedCounter;
+
+int3 _MinIndex;
+int3 _MaxIndexExclusive;
+int3 _SampleSize;
+float3 _GridMin;
+float3 _LocalSize;
+float3 _LocalStart;
+float3 _LocalEnd;
+float _VoxelSize;
+float _LocalRadius;
+float3 _CutterAxis;
+float3 _CutterRight;
+float _CutterHeight;
+float _CutBand;
+float _AffectedRadiusSqr;
+float _ChangeEpsilon;
+float _IsoLevel;
+float _DetachedAirValue;
+
+int _ProfileSegmentCount;
+int _ProfileRadiusSampleCount;
+float _ProfileRadiusSamples[32];
+int _AngularProfileAxialSampleCount;
+int _AngularProfileAngleSampleCount;
+float _AngularProfileMinRadiusSamples[512];
+float _AngularProfileMaxRadiusSamples[512];
+
+float AngularProfileSample(float normalizedHeight, float normalizedAngle, bool sampleMin)
+{
+    int axialCount = clamp(_AngularProfileAxialSampleCount, 0, 16);
+    int angleCount = clamp(_AngularProfileAngleSampleCount, 0, 32);
+    if (axialCount < 2 || angleCount < 3)
+    {
+        return -1.0;
+    }
+
+    float axialPosition = saturate(normalizedHeight) * (float)(axialCount - 1);
+    int axial0 = min((int)floor(axialPosition), axialCount - 2);
+    int axial1 = axial0 + 1;
+    float axialT = saturate(axialPosition - axial0);
+
+    float anglePosition = frac(normalizedAngle) * (float)angleCount;
+    int angle0 = (int)floor(anglePosition) % angleCount;
+    int angle1 = (angle0 + 1) % angleCount;
+    float angleT = saturate(anglePosition - floor(anglePosition));
+
+    int index00 = axial0 * angleCount + angle0;
+    int index01 = axial0 * angleCount + angle1;
+    int index10 = axial1 * angleCount + angle0;
+    int index11 = axial1 * angleCount + angle1;
+    float value00 = sampleMin ? _AngularProfileMinRadiusSamples[index00] : _AngularProfileMaxRadiusSamples[index00];
+    float value01 = sampleMin ? _AngularProfileMinRadiusSamples[index01] : _AngularProfileMaxRadiusSamples[index01];
+    float value10 = sampleMin ? _AngularProfileMinRadiusSamples[index10] : _AngularProfileMaxRadiusSamples[index10];
+    float value11 = sampleMin ? _AngularProfileMinRadiusSamples[index11] : _AngularProfileMaxRadiusSamples[index11];
+    float angleA = lerp(value00, value01, smoothstep(0.0, 1.0, angleT));
+    float angleB = lerp(value10, value11, smoothstep(0.0, 1.0, angleT));
+    return lerp(angleA, angleB, smoothstep(0.0, 1.0, axialT));
+}
+
+float2 AngularProfileInterval(float axial, float3 radial, float3 axis)
+{
+    int axialCount = clamp(_AngularProfileAxialSampleCount, 0, 16);
+    int angleCount = clamp(_AngularProfileAngleSampleCount, 0, 32);
+    if (axialCount < 2 || angleCount < 3)
+    {
+        return float2(-1.0, -1.0);
+    }
+
+    float height = max(_CutterHeight, _VoxelSize * 0.000001);
+    float normalizedHeight = saturate(axial / height);
+    float3 right = _CutterRight - axis * dot(_CutterRight, axis);
+    float rightLength = length(right);
+    right = rightLength > 0.000001 ? right / rightLength : normalize(abs(axis.y) < 0.99 ? cross(axis, float3(0, 1, 0)) : cross(axis, float3(1, 0, 0)));
+    float3 forward = normalize(cross(axis, right));
+    float angle = atan2(dot(radial, forward), dot(radial, right));
+    float normalizedAngle = frac(angle / 6.28318530718 + 1.0);
+    float minRadius = AngularProfileSample(normalizedHeight, normalizedAngle, true);
+    float maxRadius = AngularProfileSample(normalizedHeight, normalizedAngle, false);
+    if (maxRadius <= 0.000001 || minRadius < 0.0)
+    {
+        return float2(-1.0, -1.0);
+    }
+
+    return float2(_LocalRadius * minRadius, _LocalRadius * max(maxRadius, minRadius));
+}
+
+float ProfileRadiusMultiplier(float normalizedHeight)
+{
+    int sampleCount = clamp(_ProfileRadiusSampleCount, 0, 32);
+    if (sampleCount < 2)
+    {
+        return -1.0;
+    }
+
+    float samplePosition = saturate(normalizedHeight) * (float)(sampleCount - 1);
+    int sampleIndex = min((int)floor(samplePosition), sampleCount - 2);
+    float t = saturate(samplePosition - sampleIndex);
+    return lerp(
+        _ProfileRadiusSamples[sampleIndex],
+        _ProfileRadiusSamples[sampleIndex + 1],
+        smoothstep(0.0, 1.0, t));
+}
+
+float ProfileMaxRadiusMultiplier(float minNormalizedHeight, float maxNormalizedHeight)
+{
+    int sampleCount = clamp(_ProfileRadiusSampleCount, 0, 32);
+    if (sampleCount < 2)
+    {
+        return -1.0;
+    }
+
+    float minNorm = saturate(minNormalizedHeight);
+    float maxNorm = saturate(maxNormalizedHeight);
+    float maxRadius = max(ProfileRadiusMultiplier(minNorm), ProfileRadiusMultiplier(maxNorm));
+
+    for (int i = 0; i < 32; i++)
+    {
+        float sampleNorm = sampleCount > 1 ? (float)i / (float)(sampleCount - 1) : 0.0;
+        if (i < sampleCount && sampleNorm >= minNorm && sampleNorm <= maxNorm)
+        {
+            maxRadius = max(maxRadius, _ProfileRadiusSamples[i]);
+        }
+    }
+
+    return maxRadius;
+}
+
+float CutterProfileRadius(float axial)
+{
+    float normalizedHeight = saturate(axial / max(_CutterHeight, _VoxelSize * 0.000001));
+    float sampledMultiplier = ProfileRadiusMultiplier(normalizedHeight);
+    if (sampledMultiplier >= 0.0)
+    {
+        return _LocalRadius * sampledMultiplier;
+    }
+
+    int segs = max(_ProfileSegmentCount, 2);
+    float profilePosition = normalizedHeight * (float)segs;
+    int segment = min((int)floor(profilePosition), segs - 1);
+    float t = saturate(profilePosition - segment);
+    float innerRadius = _LocalRadius * 0.6535898;
+    bool segmentEven = (segment & 1) == 0;
+    bool nextSegmentEven = ((segment + 1) & 1) == 0;
+    float radiusA = segmentEven ? _LocalRadius : innerRadius;
+    float radiusB = nextSegmentEven ? _LocalRadius : innerRadius;
+    
+    // Use smoothstep for a rounded, curved profile instead of sharp zig-zags
+    float smoothT = smoothstep(0.0, 1.0, t);
+    return lerp(radiusA, radiusB, smoothT);
+}
+
+float ProfileCutterDifferenceAtRoot(float3 samplePoint, float3 cutterRoot, float3 axis)
+{
+    float3 toSample = samplePoint - cutterRoot;
+    float axial = dot(toSample, axis);
+    float3 radial = toSample - axis * axial;
+    float radialDistance = length(radial);
+    float2 interval = AngularProfileInterval(axial, radial, axis);
+    bool usesAngularProfile = _AngularProfileAxialSampleCount >= 2 && _AngularProfileAngleSampleCount >= 3;
+    float radialDifference = usesAngularProfile
+        ? (interval.y >= 0.0 ? interval.y - radialDistance : -1000000.0)
+        : CutterProfileRadius(axial) - radialDistance;
+    float axialDifference = min(axial, _CutterHeight - axial);
+    return min(radialDifference, axialDifference);
+}
+
+float CutterProfileMaxRadius(float minAxial, float maxAxial)
+{
+    float height = max(_CutterHeight, _VoxelSize * 0.000001);
+    float clampedMin = clamp(minAxial, 0.0, height);
+    float clampedMax = clamp(maxAxial, 0.0, height);
+    float sampledMultiplier = ProfileMaxRadiusMultiplier(clampedMin / height, clampedMax / height);
+    if (sampledMultiplier >= 0.0)
+    {
+        return _LocalRadius * sampledMultiplier;
+    }
+
+    float maxRadius = max(CutterProfileRadius(clampedMin), CutterProfileRadius(clampedMax));
+    int segs = max(_ProfileSegmentCount, 2);
+    float minProfilePosition = clampedMin / height * (float)segs;
+    float maxProfilePosition = clampedMax / height * (float)segs;
+    int firstEvenBoundary = (int)ceil(minProfilePosition);
+    if ((firstEvenBoundary & 1) != 0)
+    {
+        firstEvenBoundary++;
+    }
+
+    if ((float)firstEvenBoundary <= maxProfilePosition)
+    {
+        maxRadius = _LocalRadius;
+    }
+
+    return maxRadius;
+}
+
+float AxialSweptProfileCutterDifference(float3 samplePoint, float3 axis, float3 motion)
+{
+    float travel = dot(motion, axis);
+    float3 fromStart = samplePoint - _LocalStart;
+    float sampleAxial = dot(fromStart, axis);
+    float axialAtEnd = sampleAxial - travel;
+    float profileMin = max(0.0, min(sampleAxial, axialAtEnd));
+    float profileMax = min(_CutterHeight, max(sampleAxial, axialAtEnd));
+    float result = 0.0;
+
+    if (profileMin > profileMax)
+    {
+        result = max(
+            ProfileCutterDifferenceAtRoot(samplePoint, _LocalStart, axis),
+            ProfileCutterDifferenceAtRoot(samplePoint, _LocalEnd, axis));
+    }
+    else
+    {
+        float3 radial = fromStart - axis * sampleAxial;
+        float radialDifference = CutterProfileMaxRadius(profileMin, profileMax) - length(radial);
+        float sweepMin = min(0.0, travel);
+        float sweepMax = max(_CutterHeight, _CutterHeight + travel);
+        float axialDifference = min(sampleAxial - sweepMin, sweepMax - sampleAxial);
+        result = min(radialDifference, axialDifference);
+    }
+
+    return result;
+}
+
+float SweptProfileCutterDifference(float3 samplePoint)
+{
+    float3 axis = normalize(_CutterAxis);
+    float3 motion = _LocalEnd - _LocalStart;
+    float3 radialMotion = motion - axis * dot(motion, axis);
+    float3 toSampleFromStart = samplePoint - _LocalStart;
+    float3 radialFromStart = toSampleFromStart - axis * dot(toSampleFromStart, axis);
+    float t = 1.0;
+    float radialMotionLengthSqr = dot(radialMotion, radialMotion);
+    float geometryScale = max(max(_LocalRadius, _CutterHeight), _VoxelSize);
+    float radialMotionEpsilon = geometryScale * 0.000001;
+    float result = 0.0;
+
+    bool usesAngularProfile = _AngularProfileAxialSampleCount >= 2 && _AngularProfileAngleSampleCount >= 3;
+    if (radialMotionLengthSqr <= radialMotionEpsilon * radialMotionEpsilon && !usesAngularProfile)
+    {
+        result = AxialSweptProfileCutterDifference(samplePoint, axis, motion);
+    }
+    else
+    {
+        t = saturate(dot(radialFromStart, radialMotion) / radialMotionLengthSqr);
+
+        // The radial projection is exact for a lateral sweep. Include the
+        // current cutter for mixed radial/axial motion as well.
+        float projectedDifference = ProfileCutterDifferenceAtRoot(
+            samplePoint,
+            lerp(_LocalStart, _LocalEnd, t),
+            axis);
+        float endDifference = ProfileCutterDifferenceAtRoot(samplePoint, _LocalEnd, axis);
+        result = max(projectedDifference, endDifference);
+    }
+
+    return result;
+}
+
+[numthreads(8, 8, 4)]
+void CutCapsuleSdf(uint3 id : SV_DispatchThreadID)
+{
+    int3 sample = _MinIndex + int3(id);
+    if (sample.x >= _MaxIndexExclusive.x || sample.y >= _MaxIndexExclusive.y || sample.z >= _MaxIndexExclusive.z)
+    {
+        return;
+    }
+
+    float3 samplePoint = _GridMin + (float3(sample) - 1.0) * _VoxelSize;
+    float3 segment = _LocalEnd - _LocalStart;
+    float segmentLengthSqr = dot(segment, segment);
+    float segmentEpsilon = max(_LocalRadius, _VoxelSize) * 0.000001;
+    float t = 1.0;
+
+    if (segmentLengthSqr > segmentEpsilon * segmentEpsilon)
+    {
+        t = saturate(dot(samplePoint - _LocalStart, segment) / segmentLengthSqr);
+    }
+
+    float3 closest = _LocalStart + segment * t;
+    float3 toSample = samplePoint - closest;
+    float distanceSqr = dot(toSample, toSample);
+    if (distanceSqr > _AffectedRadiusSqr)
+    {
+        return;
+    }
+
+    int index = sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
+    float cutterDifference = _LocalRadius - sqrt(distanceSqr);
+    float oldValue = _SdfSamples[index];
+    float newValue = max(oldValue, cutterDifference);
+
+    if (newValue > oldValue + _ChangeEpsilon)
+    {
+        _SdfSamples[index] = newValue;
+        InterlockedAdd(_ChangedCounter[0], 1);
+    }
+}
+
+[numthreads(8, 8, 4)]
+void CutProfileCutterSdf(uint3 id : SV_DispatchThreadID)
+{
+    int3 sample = _MinIndex + int3(id);
+    if (sample.x >= _MaxIndexExclusive.x || sample.y >= _MaxIndexExclusive.y || sample.z >= _MaxIndexExclusive.z)
+    {
+        return;
+    }
+
+    float3 samplePoint = _GridMin + (float3(sample) - 1.0) * _VoxelSize;
+    float cutterDifference = SweptProfileCutterDifference(samplePoint);
+    if (cutterDifference < -_CutBand)
+    {
+        return;
+    }
+
+    int index = sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
+    float oldValue = _SdfSamples[index];
+    float newValue = max(oldValue, cutterDifference);
+
+    if (newValue > oldValue + _ChangeEpsilon)
+    {
+        _SdfSamples[index] = newValue;
+        InterlockedAdd(_ChangedCounter[0], 1);
+    }
+}
+
+[numthreads(8, 8, 4)]
+void InitializeBoxSdf(uint3 id : SV_DispatchThreadID)
+{
+    int3 sample = int3(id);
+    if (sample.x >= _SampleSize.x || sample.y >= _SampleSize.y || sample.z >= _SampleSize.z)
+    {
+        return;
+    }
+
+    float3 samplePoint = _GridMin + (float3(sample) - 1.0) * _VoxelSize;
+    float halfVoxel = _VoxelSize * 0.5;
+    float3 halfSize = max(_LocalSize * 0.5 - halfVoxel, float3(halfVoxel, halfVoxel, halfVoxel));
+    float3 q = abs(samplePoint) - halfSize;
+    float3 outside = max(q, 0.0);
+    float inside = min(max(q.x, max(q.y, q.z)), 0.0);
+    float sdf = length(outside) + inside;
+
+    int index = sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
+    _SdfSamples[index] = sdf;
+}
+
+[numthreads(8, 1, 8)]
+void RemoveUnsupportedColumnsSdf(uint3 id : SV_DispatchThreadID)
+{
+    int x = (int)id.x;
+    int z = (int)id.z;
+    if (x >= _SampleSize.x || z >= _SampleSize.z)
+    {
+        return;
+    }
+
+    bool supported = false;
+    float bottomSupportY = -_LocalSize.y * 0.5 + _VoxelSize * 1.5;
+
+    [loop]
+    for (int y = 0; y < _SampleSize.y; y++)
+    {
+        int index = x + _SampleSize.x * (y + _SampleSize.y * z);
+        float value = _SdfSamples[index];
+        bool solid = value <= _IsoLevel;
+        float3 samplePoint = _GridMin + (float3(x, y, z) - 1.0) * _VoxelSize;
+        bool bottomSeed = solid && samplePoint.y <= bottomSupportY;
+
+        supported = solid && (supported || bottomSeed);
+        if (solid && !supported)
+        {
+            _SdfSamples[index] = max(value, _DetachedAirValue);
+            InterlockedAdd(_ChangedCounter[0], 1);
+        }
+
+        if (!solid)
+        {
+            supported = false;
+        }
+    }
+}

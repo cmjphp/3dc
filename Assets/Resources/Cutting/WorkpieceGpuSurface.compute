@@ -1,0 +1,225 @@
+#pragma kernel BuildSurface
+
+struct GpuSurfaceVertex
+{
+    float3 position;
+    float3 normal;
+};
+
+StructuredBuffer<float> _SdfSamples;
+AppendStructuredBuffer<GpuSurfaceVertex> _Vertices;
+
+int3 _SampleSize;
+int3 _CellSize;
+float3 _GridMin;
+float _VoxelSize;
+float _IsoLevel;
+
+int SampleIndex(int3 sample)
+{
+    return sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
+}
+
+float GetSdf(int3 sample)
+{
+    sample = clamp(sample, int3(0, 0, 0), _SampleSize - 1);
+    return _SdfSamples[SampleIndex(sample)];
+}
+
+float3 GetSamplePoint(int3 sample)
+{
+    return _GridMin + (float3(sample) - 1.0) * _VoxelSize;
+}
+
+float SampleSdfAtPoint(float3 localPoint)
+{
+    float3 grid = (localPoint - _GridMin) / _VoxelSize + 1.0;
+    int3 i0 = clamp((int3)floor(grid), int3(0, 0, 0), _SampleSize - 2);
+    int3 i1 = min(i0 + 1, _SampleSize - 1);
+    float3 t = saturate(grid - float3(i0));
+
+    float c000 = GetSdf(int3(i0.x, i0.y, i0.z));
+    float c100 = GetSdf(int3(i1.x, i0.y, i0.z));
+    float c010 = GetSdf(int3(i0.x, i1.y, i0.z));
+    float c110 = GetSdf(int3(i1.x, i1.y, i0.z));
+    float c001 = GetSdf(int3(i0.x, i0.y, i1.z));
+    float c101 = GetSdf(int3(i1.x, i0.y, i1.z));
+    float c011 = GetSdf(int3(i0.x, i1.y, i1.z));
+    float c111 = GetSdf(int3(i1.x, i1.y, i1.z));
+
+    float c00 = lerp(c000, c100, t.x);
+    float c10 = lerp(c010, c110, t.x);
+    float c01 = lerp(c001, c101, t.x);
+    float c11 = lerp(c011, c111, t.x);
+    float c0 = lerp(c00, c10, t.y);
+    float c1 = lerp(c01, c11, t.y);
+    return lerp(c0, c1, t.z);
+}
+
+float3 GetSdfNormal(float3 localPoint)
+{
+    float e = _VoxelSize;
+    float dx = SampleSdfAtPoint(localPoint + float3(e, 0.0, 0.0)) - SampleSdfAtPoint(localPoint - float3(e, 0.0, 0.0));
+    float dy = SampleSdfAtPoint(localPoint + float3(0.0, e, 0.0)) - SampleSdfAtPoint(localPoint - float3(0.0, e, 0.0));
+    float dz = SampleSdfAtPoint(localPoint + float3(0.0, 0.0, e)) - SampleSdfAtPoint(localPoint - float3(0.0, 0.0, e));
+    float3 normal = float3(dx, dy, dz);
+    return dot(normal, normal) < 0.000001 ? float3(0.0, 1.0, 0.0) : normalize(normal);
+}
+
+float3 InterpolateIso(float3 a, float3 b, float valueA, float valueB)
+{
+    float delta = valueB - valueA;
+    float t = abs(delta) < 0.000001 ? 0.5 : saturate((_IsoLevel - valueA) / delta);
+    return lerp(a, b, t);
+}
+
+void AppendVertex(float3 position)
+{
+    GpuSurfaceVertex vertex;
+    vertex.position = position;
+    vertex.normal = GetSdfNormal(position);
+    _Vertices.Append(vertex);
+}
+
+void AppendTriangle(float3 a, float3 b, float3 c)
+{
+    float3 centroidNormal = GetSdfNormal((a + b + c) / 3.0);
+    float3 faceNormal = cross(b - a, c - a);
+    float minAreaSqr = _VoxelSize * _VoxelSize * _VoxelSize * _VoxelSize * 0.000001;
+
+    if (dot(faceNormal, faceNormal) <= minAreaSqr)
+    {
+        return;
+    }
+
+    if (dot(faceNormal, centroidNormal) < 0.0)
+    {
+        float3 temp = b;
+        b = c;
+        c = temp;
+    }
+
+    AppendVertex(a);
+    AppendVertex(b);
+    AppendVertex(c);
+}
+
+void AddIntersection(inout int count, inout float3 q0, inout float3 q1, inout float3 q2, inout float3 q3, float3 q)
+{
+    if (count == 0)
+    {
+        q0 = q;
+    }
+    else if (count == 1)
+    {
+        q1 = q;
+    }
+    else if (count == 2)
+    {
+        q2 = q;
+    }
+    else
+    {
+        q3 = q;
+    }
+
+    count++;
+}
+
+void AddEdgeIfCrossed(
+    inout int count,
+    inout float3 q0,
+    inout float3 q1,
+    inout float3 q2,
+    inout float3 q3,
+    float3 a,
+    float3 b,
+    float valueA,
+    float valueB)
+{
+    bool insideA = valueA <= _IsoLevel;
+    bool insideB = valueB <= _IsoLevel;
+    if (insideA == insideB)
+    {
+        return;
+    }
+
+    AddIntersection(count, q0, q1, q2, q3, InterpolateIso(a, b, valueA, valueB));
+}
+
+void PolygonizeTetrahedron(float3 p0, float3 p1, float3 p2, float3 p3, float v0, float v1, float v2, float v3)
+{
+    float3 q0 = float3(0.0, 0.0, 0.0);
+    float3 q1 = float3(0.0, 0.0, 0.0);
+    float3 q2 = float3(0.0, 0.0, 0.0);
+    float3 q3 = float3(0.0, 0.0, 0.0);
+    int count = 0;
+
+    AddEdgeIfCrossed(count, q0, q1, q2, q3, p0, p1, v0, v1);
+    AddEdgeIfCrossed(count, q0, q1, q2, q3, p0, p2, v0, v2);
+    AddEdgeIfCrossed(count, q0, q1, q2, q3, p0, p3, v0, v3);
+    AddEdgeIfCrossed(count, q0, q1, q2, q3, p1, p2, v1, v2);
+    AddEdgeIfCrossed(count, q0, q1, q2, q3, p1, p3, v1, v3);
+    AddEdgeIfCrossed(count, q0, q1, q2, q3, p2, p3, v2, v3);
+
+    if (count == 3)
+    {
+        AppendTriangle(q0, q1, q2);
+    }
+    else if (count == 4)
+    {
+        AppendTriangle(q0, q1, q2);
+        AppendTriangle(q0, q2, q3);
+    }
+}
+
+[numthreads(8, 8, 4)]
+void BuildSurface(uint3 id : SV_DispatchThreadID)
+{
+    int3 cell = int3(id);
+    if (cell.x >= _CellSize.x || cell.y >= _CellSize.y || cell.z >= _CellSize.z)
+    {
+        return;
+    }
+
+    int3 s0 = cell + int3(0, 0, 0);
+    int3 s1 = cell + int3(1, 0, 0);
+    int3 s2 = cell + int3(1, 0, 1);
+    int3 s3 = cell + int3(0, 0, 1);
+    int3 s4 = cell + int3(0, 1, 0);
+    int3 s5 = cell + int3(1, 1, 0);
+    int3 s6 = cell + int3(1, 1, 1);
+    int3 s7 = cell + int3(0, 1, 1);
+
+    float v0 = GetSdf(s0);
+    float v1 = GetSdf(s1);
+    float v2 = GetSdf(s2);
+    float v3 = GetSdf(s3);
+    float v4 = GetSdf(s4);
+    float v5 = GetSdf(s5);
+    float v6 = GetSdf(s6);
+    float v7 = GetSdf(s7);
+
+    float minValue = min(min(min(v0, v1), min(v2, v3)), min(min(v4, v5), min(v6, v7)));
+    float maxValue = max(max(max(v0, v1), max(v2, v3)), max(max(v4, v5), max(v6, v7)));
+    if (minValue > _IsoLevel || maxValue < _IsoLevel)
+    {
+        return;
+    }
+
+    float3 p0 = GetSamplePoint(s0);
+    float3 p1 = GetSamplePoint(s1);
+    float3 p2 = GetSamplePoint(s2);
+    float3 p3 = GetSamplePoint(s3);
+    float3 p4 = GetSamplePoint(s4);
+    float3 p5 = GetSamplePoint(s5);
+    float3 p6 = GetSamplePoint(s6);
+    float3 p7 = GetSamplePoint(s7);
+
+    PolygonizeTetrahedron(p0, p5, p1, p6, v0, v5, v1, v6);
+    PolygonizeTetrahedron(p0, p1, p2, p6, v0, v1, v2, v6);
+    PolygonizeTetrahedron(p0, p2, p3, p6, v0, v2, v3, v6);
+    PolygonizeTetrahedron(p0, p3, p7, p6, v0, v3, v7, v6);
+    PolygonizeTetrahedron(p0, p7, p4, p6, v0, v7, v4, v6);
+    PolygonizeTetrahedron(p0, p4, p5, p6, v0, v4, v5, v6);
+}
