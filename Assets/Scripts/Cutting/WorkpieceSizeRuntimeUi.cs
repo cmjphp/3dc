@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Threading.Tasks;
 using UnityEngine;
 
 #if UNITY_EDITOR
@@ -31,6 +32,20 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
     private string[] cutterToolNames = new string[0];
     private readonly string[] blankShapeNames = { "盒", "圆柱", "管", "半管", "导入" };
     private bool collapsed;
+    private Task<StlImportResult> pendingStlImportTask;
+    private string pendingStlImportPath;
+    private bool stlImportInProgress;
+    private bool stlGeneratePending;
+    private int stlGeneratePendingFrame;
+
+    private sealed class StlImportResult
+    {
+        public string path;
+        public bool success;
+        public string error;
+        public int triangleCount;
+        public long elapsedMilliseconds;
+    }
 
     public void Configure(CuttingDemoBootstrap owner)
     {
@@ -58,6 +73,12 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
         windowRect = GUI.Window(WindowId, windowRect, DrawWindow, "加工参数");
     }
 
+    private void Update()
+    {
+        ApplyPendingStlGeneration();
+        PollPendingStlImport();
+    }
+
     private void DrawWindow(int windowId)
     {
         if (GUI.Button(new Rect(windowRect.width - 32f, 4f, 24f, 20f), collapsed ? "+" : "−"))
@@ -69,10 +90,14 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
         {
             float y = DrawWorkpieceDefinitionControls(30f);
 
-            if (GUI.Button(new Rect(14f, y, 272f, 30f), "应用工件/毛坯"))
+            bool previousGuiEnabled = GUI.enabled;
+            bool importBusy = IsImportBusy;
+            GUI.enabled = previousGuiEnabled && !importBusy;
+            if (GUI.Button(new Rect(14f, y, 272f, 30f), importBusy ? ImportBusyButtonText : "应用工件/毛坯"))
             {
                 ApplyWorkpieceDefinition();
             }
+            GUI.enabled = previousGuiEnabled;
 
             float cutterListLabelY = y + 44f;
             GUI.Label(new Rect(14f, cutterListLabelY, 270f, 20f), "刀具列表");
@@ -169,10 +194,14 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
     private void DrawImportedModelSelector(float y)
     {
         GUI.Label(new Rect(14f, y, 86f, 24f), "导入模型");
-        if (GUI.Button(new Rect(104f, y, 182f, 24f), "选择模型文件"))
+        bool previousGuiEnabled = GUI.enabled;
+        bool importBusy = IsImportBusy;
+        GUI.enabled = previousGuiEnabled && !importBusy;
+        if (GUI.Button(new Rect(104f, y, 182f, 24f), importBusy ? "处理中..." : "选择模型文件"))
         {
             SelectImportedBlankModel();
         }
+        GUI.enabled = previousGuiEnabled;
 
         string displayPath = string.IsNullOrEmpty(importedBlankResourcePath)
             ? "未选择"
@@ -216,7 +245,12 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
             return;
         }
 
+        var applyWatch = System.Diagnostics.Stopwatch.StartNew();
         bool applied = bootstrap.SetWorkpieceDefinition(requested, shape, innerRadius, importedBlankResourcePath);
+        applyWatch.Stop();
+        Debug.Log(
+            $"WORKPIECE_APPLY_DONE shape={shape} applied={applied} ms={applyWatch.ElapsedMilliseconds} " +
+            $"resource={importedBlankResourcePath}");
         SyncFromBootstrap();
         if (!applied)
         {
@@ -365,28 +399,28 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
         string absolutePath = EditorUtility.OpenFilePanel(
             "选择导入毛坯模型",
             Application.dataPath,
-            "fbx,obj");
+            "stl,fbx,obj");
         if (string.IsNullOrEmpty(absolutePath))
         {
             return;
         }
 
-        string projectPath = Application.dataPath.Replace('\\', '/');
         string normalizedPath = absolutePath.Replace('\\', '/');
-        if (!normalizedPath.StartsWith(projectPath + "/", System.StringComparison.OrdinalIgnoreCase))
+        if (ImportedStlMeshLoader.IsStlPath(normalizedPath))
         {
-            validationMessage = "请选择项目 Assets/Resources 下的模型。";
+            importedBlankResourcePath = normalizedPath;
+            BeginStlImport(normalizedPath);
             return;
         }
 
-        string assetPath = "Assets" + normalizedPath.Substring(projectPath.Length);
+        string assetPath;
+        if (!TryPrepareUnityImportedBlankAsset(normalizedPath, out assetPath, out string importError))
+        {
+            validationMessage = importError;
+            return;
+        }
+
         const string resourcesPrefix = "Assets/Resources/";
-        if (!assetPath.StartsWith(resourcesPrefix, System.StringComparison.OrdinalIgnoreCase))
-        {
-            validationMessage = "模型需位于 Assets/Resources 下。";
-            return;
-        }
-
         importedBlankResourcePath = assetPath.Substring(resourcesPrefix.Length);
         int extensionIndex = importedBlankResourcePath.LastIndexOf('.');
         if (extensionIndex > 0)
@@ -395,10 +429,164 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
         }
 
         validationMessage = $"已选择：{importedBlankResourcePath}";
+        ApplyWorkpieceDefinition();
 #else
         validationMessage = "当前运行环境不支持文件选择。";
 #endif
     }
+
+    private void BeginStlImport(string normalizedPath)
+    {
+        if (!TryParseImportedScalePercent(out Vector3 scalePercent))
+        {
+            return;
+        }
+
+        pendingStlImportPath = normalizedPath;
+        stlImportInProgress = true;
+        stlGeneratePending = false;
+        validationMessage = $"正在导入 STL：{System.IO.Path.GetFileName(normalizedPath)}";
+        pendingStlImportTask = Task.Run(
+            () =>
+            {
+                System.Diagnostics.Stopwatch stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                float[] stlBounds6 = new float[6];
+                int triangleCount;
+                bool success = SdfNativePlugin.sdf_get_stl_bounds(
+                    normalizedPath,
+                    scalePercent.x,
+                    scalePercent.y,
+                    scalePercent.z,
+                    stlBounds6,
+                    out triangleCount) != 0;
+                stopwatch.Stop();
+                return new StlImportResult
+                {
+                    path = normalizedPath,
+                    success = success,
+                    error = success ? null : "native STL parser rejected the file or failed to read it.",
+                    triangleCount = System.Math.Max(0, triangleCount),
+                    elapsedMilliseconds = stopwatch.ElapsedMilliseconds
+                };
+            });
+    }
+
+    private void PollPendingStlImport()
+    {
+        if (pendingStlImportTask == null || !pendingStlImportTask.IsCompleted)
+        {
+            return;
+        }
+
+        Task<StlImportResult> completedTask = pendingStlImportTask;
+        pendingStlImportTask = null;
+        stlImportInProgress = false;
+
+        StlImportResult result;
+        try
+        {
+            result = completedTask.Result;
+        }
+        catch (System.Exception ex)
+        {
+            validationMessage = $"STL 导入失败：{ex.GetBaseException().Message}";
+            return;
+        }
+
+        if (result.path != pendingStlImportPath)
+        {
+            return;
+        }
+
+        if (!result.success)
+        {
+            validationMessage = $"STL 导入失败：{result.error}";
+            return;
+        }
+
+        validationMessage =
+            $"STL 导入检查完成：{result.triangleCount:n0} 面，{result.elapsedMilliseconds} ms，正在生成工件...";
+        Debug.Log(
+            $"STL_NATIVE_BOUNDS_DONE path={result.path} triangles={result.triangleCount:n0} " +
+            $"ms={result.elapsedMilliseconds}");
+        stlGeneratePending = true;
+        stlGeneratePendingFrame = Time.frameCount;
+    }
+
+    private bool IsImportBusy
+    {
+        get { return stlImportInProgress || stlGeneratePending; }
+    }
+
+    private string ImportBusyButtonText
+    {
+        get { return stlImportInProgress ? "正在解析模型..." : "正在生成工件..."; }
+    }
+
+    private void ApplyPendingStlGeneration()
+    {
+        if (!stlGeneratePending || Time.frameCount <= stlGeneratePendingFrame)
+        {
+            return;
+        }
+
+        stlGeneratePending = false;
+        ApplyWorkpieceDefinition();
+    }
+
+#if UNITY_EDITOR
+    private bool TryPrepareUnityImportedBlankAsset(
+        string normalizedPath,
+        out string assetPath,
+        out string error)
+    {
+        assetPath = null;
+        error = null;
+
+        string extension = System.IO.Path.GetExtension(normalizedPath);
+        if (!string.Equals(extension, ".fbx", System.StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(extension, ".obj", System.StringComparison.OrdinalIgnoreCase))
+        {
+            error = "当前只支持直接导入 STL，或复制 FBX/OBJ 到 Resources。";
+            return false;
+        }
+
+        string projectPath = Application.dataPath.Replace('\\', '/');
+        const string resourcesPrefix = "Assets/Resources/";
+        if (normalizedPath.StartsWith(projectPath + "/", System.StringComparison.OrdinalIgnoreCase))
+        {
+            string existingAssetPath = "Assets" + normalizedPath.Substring(projectPath.Length);
+            if (existingAssetPath.StartsWith(resourcesPrefix, System.StringComparison.OrdinalIgnoreCase))
+            {
+                assetPath = existingAssetPath;
+                return true;
+            }
+        }
+
+        string targetFolder = "Assets/Resources/ImportedBlanks";
+        if (!AssetDatabase.IsValidFolder(targetFolder))
+        {
+            AssetDatabase.CreateFolder("Assets/Resources", "ImportedBlanks");
+        }
+
+        string fileName = System.IO.Path.GetFileName(normalizedPath);
+        string targetAssetPath = AssetDatabase.GenerateUniqueAssetPath(targetFolder + "/" + fileName);
+        try
+        {
+            System.IO.File.Copy(normalizedPath, targetAssetPath);
+            AssetDatabase.ImportAsset(targetAssetPath, ImportAssetOptions.ForceSynchronousImport);
+            AssetDatabase.Refresh();
+        }
+        catch (System.Exception ex)
+        {
+            error = $"复制模型到 Resources 失败：{ex.Message}";
+            return false;
+        }
+
+        assetPath = targetAssetPath;
+        return true;
+    }
+#endif
 
     private void ApplyCutterParameters()
     {
@@ -491,7 +679,9 @@ public sealed class WorkpieceSizeRuntimeUi : MonoBehaviour
 
         selectedBlankShapeIndex = Mathf.Clamp((int)bootstrap.blankShape, 0, blankShapeNames.Length - 1);
         SyncShapeFieldsFromCurrentDefinition(SelectedBlankShape);
-        importedBlankResourcePath = bootstrap.importedBlankModelResourcePath ?? string.Empty;
+        importedBlankResourcePath = !string.IsNullOrEmpty(bootstrap.importedBlankFilePath)
+            ? bootstrap.importedBlankFilePath
+            : bootstrap.importedBlankModelResourcePath ?? string.Empty;
         cutterDiameter = (bootstrap.cutterRadius * 2f).ToString("0.###", invariantCulture);
         cutterHeight = (bootstrap.cutterRadius * bootstrap.cutterHeightScale).ToString(
             "0.###",

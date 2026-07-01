@@ -38,6 +38,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     public WorkpieceBlankShape blankShape = WorkpieceBlankShape.Box;
     [Min(0f)] public float blankInnerRadius = 20f;
     public GameObject importedBlankMeshRoot;
+    public string importedBlankFilePath;
     public Vector3 importedBlankScalePercent = Vector3.one * 100f;
 
     [Header("Surface")]
@@ -726,22 +727,69 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             return true;
         }
 
-        if (importedBlankMeshRoot == null ||
-            !TryExtractImportedBlankMesh(
+        bool loaded = false;
+        float[] vertices = null;
+        int vertexCount = 0;
+        int[] triangleIndices = null;
+        int indexCount = 0;
+        if (ImportedStlMeshLoader.IsStlPath(importedBlankFilePath))
+        {
+            float[] stlBounds6 = new float[6];
+            loaded = SdfNativePlugin.sdf_get_stl_bounds(
+                importedBlankFilePath,
+                importedBlankScalePercent.x,
+                importedBlankScalePercent.y,
+                importedBlankScalePercent.z,
+                stlBounds6,
+                out int triangleCount) != 0;
+            if (!loaded)
+            {
+                Debug.LogWarning("STL blank mesh native bounds extraction failed.", this);
+            }
+            else
+            {
+                nativeBlankMeshVertices = null;
+                nativeBlankMeshTriangleIndices = null;
+                nativeBlankMeshVertexCount = 0;
+                nativeBlankMeshIndexCount = 0;
+                nativeBlankMeshLocalMin = new Vector3(stlBounds6[0], stlBounds6[1], stlBounds6[2]);
+                nativeBlankMeshLocalMax = new Vector3(stlBounds6[3], stlBounds6[4], stlBounds6[5]);
+                nativeBlankMeshTriangleCount = triangleCount;
+                return ValidateImportedBlankMeshBounds(
+                    nativeBlankMeshLocalMin,
+                    nativeBlankMeshLocalMax,
+                    out string reason)
+                    ? true
+                    : RejectImportedBlankMeshBounds(reason);
+            }
+        }
+        else if (importedBlankMeshRoot != null)
+        {
+            loaded = TryExtractImportedBlankMesh(
                 importedBlankMeshRoot,
-                out float[] vertices,
-                out int vertexCount,
-                out int[] triangleIndices,
-                out int indexCount))
+                out vertices,
+                out vertexCount,
+                out triangleIndices,
+                out indexCount);
+        }
+
+        if (!loaded)
         {
             ClearNativeBlankMesh();
             Debug.LogWarning(
-                "Imported blank mesh extraction failed. Assign a readable third-party mesh root before using ImportedMesh blank shape.",
+                "Imported blank mesh extraction failed. Select a readable STL file or assign a readable third-party mesh root before using ImportedMesh blank shape.",
                 this);
             return false;
         }
 
         return SetNativeBlankMesh(vertices, vertexCount, triangleIndices, indexCount);
+    }
+
+    private bool RejectImportedBlankMeshBounds(string reason)
+    {
+        ClearNativeBlankMesh();
+        Debug.LogWarning($"Imported blank mesh rejected: {reason}", this);
+        return false;
     }
 
     public bool SetNativeBlankMesh(
@@ -1068,6 +1116,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
     public void ResetWorkpiece()
     {
+        var resetWatch = System.Diagnostics.Stopwatch.StartNew();
         EnsureComponents();
         CancelAsyncRebuild();
         EnforceSdfAllocationBudget();
@@ -1087,8 +1136,11 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             voxels = null;
             InitializeSdfSamples();
         }
+        long sampleInitMs = resetWatch.ElapsedMilliseconds;
         InitializeNativeSdfPlugin();
+        long nativeInitMs = resetWatch.ElapsedMilliseconds - sampleInitMs;
         InitializeGpuSdfResources();
+        long gpuResourceMs = resetWatch.ElapsedMilliseconds - sampleInitMs - nativeInitMs;
 
         if (UsesGpuSurfaceRendering)
         {
@@ -1131,6 +1183,14 @@ public sealed class WorkpieceVoxel : MonoBehaviour
                 RebuildMeshImmediate();
             }
         }
+
+        resetWatch.Stop();
+        long surfaceMs = resetWatch.ElapsedMilliseconds - sampleInitMs - nativeInitMs - gpuResourceMs;
+        Debug.Log(
+            $"WORKPIECE_RESET_TIMING shape={blankShape} samples={SdfSampleCountLong:n0} " +
+            $"sampleInitMs={sampleInitMs} nativeInitMs={nativeInitMs} " +
+            $"gpuResourceMs={gpuResourceMs} surfaceMs={surfaceMs} totalMs={resetWatch.ElapsedMilliseconds}",
+            this);
     }
 
     public bool CutSweptProfileCutter(Vector3 worldStart, Vector3 worldEnd, Vector3 worldAxis, float worldRadius, float worldHeight, bool rebuildMesh)
@@ -3488,7 +3548,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             }
             else
             {
-                UploadSdfFromNative();
+                UploadSdfFromNative("NativeInit");
             }
 
             int nativeBackend = SdfNativePlugin.sdf_get_active_compute_backend();
@@ -3539,21 +3599,52 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         }
 
         if (!sdfNativeReady ||
-            nativeBlankMeshVertices == null ||
-            nativeBlankMeshTriangleIndices == null ||
-            nativeBlankMeshVertexCount <= 0 ||
-            nativeBlankMeshIndexCount < 3)
+            (!ImportedStlMeshLoader.IsStlPath(importedBlankFilePath) &&
+                (nativeBlankMeshVertices == null ||
+                 nativeBlankMeshTriangleIndices == null ||
+                 nativeBlankMeshVertexCount <= 0 ||
+                 nativeBlankMeshIndexCount < 3)))
         {
             return false;
         }
 
         try
         {
-            int uploaded = SdfNativePlugin.sdf_set_blank_mesh(
-                nativeBlankMeshVertices,
-                nativeBlankMeshVertexCount,
-                nativeBlankMeshTriangleIndices,
-                nativeBlankMeshIndexCount);
+            var nativeBuildWatch = System.Diagnostics.Stopwatch.StartNew();
+            int uploaded;
+            if (ImportedStlMeshLoader.IsStlPath(importedBlankFilePath))
+            {
+                float[] stlBounds6 = new float[6];
+                uploaded = SdfNativePlugin.sdf_set_blank_stl_file(
+                    importedBlankFilePath,
+                    importedBlankScalePercent.x,
+                    importedBlankScalePercent.y,
+                    importedBlankScalePercent.z,
+                    stlBounds6,
+                    out int triangleCount);
+                if (uploaded != 0)
+                {
+                    nativeBlankMeshLocalMin = new Vector3(stlBounds6[0], stlBounds6[1], stlBounds6[2]);
+                    nativeBlankMeshLocalMax = new Vector3(stlBounds6[3], stlBounds6[4], stlBounds6[5]);
+                    nativeBlankMeshTriangleCount = triangleCount;
+                    nativeBlankMeshVertexCount = 0;
+                    nativeBlankMeshIndexCount = triangleCount * 3;
+                }
+            }
+            else
+            {
+                uploaded = SdfNativePlugin.sdf_set_blank_mesh(
+                    nativeBlankMeshVertices,
+                    nativeBlankMeshVertexCount,
+                    nativeBlankMeshTriangleIndices,
+                    nativeBlankMeshIndexCount);
+            }
+            nativeBuildWatch.Stop();
+            Debug.Log(
+                $"IMPORTED_BLANK_NATIVE_BUILD vertices={nativeBlankMeshVertexCount:n0} " +
+                $"triangles={nativeBlankMeshTriangleCount:n0} source={(ImportedStlMeshLoader.IsStlPath(importedBlankFilePath) ? "STL_FILE" : "UNITY_MESH")} " +
+                $"ms={nativeBuildWatch.ElapsedMilliseconds}",
+                this);
             if (uploaded == 0)
             {
                 return false;
@@ -3568,10 +3659,10 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             nextNativeConnectivityStallLogTime = 0f;
             lastNativeConnectivityDirtyTime = 0f;
             nativeConnectivityHasRegion = false;
-            UploadSdfFromNative();
+            UploadSdfFromNative("ImportedBlank");
             Debug.Log(
                 $"Native imported blank mesh uploaded: vertices={nativeBlankMeshVertexCount:n0}, " +
-                $"triangles={nativeBlankMeshIndexCount / 3:n0}, " +
+                $"triangles={nativeBlankMeshTriangleCount:n0}, " +
                 $"meshBounds=({nativeBlankMeshLocalMin}..{nativeBlankMeshLocalMax}).",
                 this);
             return true;
@@ -3954,7 +4045,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         };
     }
 
-    private void UploadSdfFromNative()
+    private void UploadSdfFromNative(string timingContext = null)
     {
         if (!sdfNativeReady)
         {
@@ -3963,18 +4054,34 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         try
         {
+            var syncWatch = string.IsNullOrEmpty(timingContext)
+                ? null
+                : System.Diagnostics.Stopwatch.StartNew();
             EnsureSdfLinearSamples();
+            long ensureMs = syncWatch != null ? syncWatch.ElapsedMilliseconds : 0L;
             SdfNativePlugin.sdf_get_data(sdfLinearSamples, sdfLinearSamples.Length);
+            long readbackMs = syncWatch != null ? syncWatch.ElapsedMilliseconds - ensureMs : 0L;
 
             if (sdfSamples != null)
             {
                 CopyLinearToSdfSamples();
             }
+            long copyMs = syncWatch != null ? syncWatch.ElapsedMilliseconds - ensureMs - readbackMs : 0L;
 
             // Upload to GPU
             if (sdfSampleBuffer != null)
             {
                 sdfSampleBuffer.SetData(sdfLinearSamples);
+            }
+            if (syncWatch != null)
+            {
+                syncWatch.Stop();
+                long gpuUploadMs = syncWatch.ElapsedMilliseconds - ensureMs - readbackMs - copyMs;
+                Debug.Log(
+                    $"NATIVE_SDF_SYNC context={timingContext} samples={sdfLinearSamples.Length:n0} " +
+                    $"ensureMs={ensureMs} readbackMs={readbackMs} copyMs={copyMs} " +
+                    $"gpuUploadMs={gpuUploadMs} totalMs={syncWatch.ElapsedMilliseconds}",
+                    this);
             }
         }
         catch (System.Exception ex)

@@ -9,7 +9,7 @@ public static class SdfNativePlugin
 {
     // Bump the filename when the native implementation changes so an open
     // Unity editor does not keep calling the already-loaded dylib image.
-    private const string DllName = "cutting_kernel_v44";
+    private const string DllName = "cutting_kernel_v45";
     public const string PluginName = DllName;
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
@@ -187,6 +187,24 @@ public static class SdfNativePlugin
         int vertexCount,
         int[] triangleIndices,
         int indexCount);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int sdf_get_stl_bounds(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string filePath,
+        float scalePercentX,
+        float scalePercentY,
+        float scalePercentZ,
+        float[] bounds6,
+        out int triangleCount);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int sdf_set_blank_stl_file(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string filePath,
+        float scalePercentX,
+        float scalePercentY,
+        float scalePercentZ,
+        float[] bounds6,
+        out int triangleCount);
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     public static extern void sdf_clear_blank_mesh();

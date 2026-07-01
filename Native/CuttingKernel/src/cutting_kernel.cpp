@@ -2,13 +2,17 @@
 // Unity owns interaction and rendering; this file owns concrete SDF cutting.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -166,9 +170,27 @@ struct State {
 #endif
 };
 
+struct ImportedMeshData {
+    std::vector<Vec3> vertices;
+    std::vector<int> triangleIndices;
+    Vec3 boundsMin;
+    Vec3 boundsMax;
+};
+
+struct ImportedStlCache {
+    std::string path;
+    float scaleX = 0.0f;
+    float scaleY = 0.0f;
+    float scaleZ = 0.0f;
+    ImportedMeshData mesh;
+    bool valid = false;
+};
+
 State gState;
 std::mutex gMutex;
+std::mutex gImportCacheMutex;
 std::thread gConnectivityThread;
+ImportedStlCache gImportedStlCache;
 
 float dot(const Vec3& a, const Vec3& b)
 {
@@ -212,6 +234,194 @@ float clampF(float v, float lo, float hi)
 int clampI(int v, int lo, int hi)
 {
     return std::min(hi, std::max(lo, v));
+}
+
+uint32_t readU32Le(const unsigned char* bytes)
+{
+    return static_cast<uint32_t>(bytes[0]) |
+           (static_cast<uint32_t>(bytes[1]) << 8) |
+           (static_cast<uint32_t>(bytes[2]) << 16) |
+           (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+float readF32Le(const unsigned char* bytes)
+{
+    uint32_t raw = readU32Le(bytes);
+    float value = 0.0f;
+    std::memcpy(&value, &raw, sizeof(float));
+    return value;
+}
+
+Vec3 sanitizeImportedScalePercent(float x, float y, float z)
+{
+    return Vec3(
+        clampF(std::isfinite(x) ? x : 100.0f, 0.001f, 1000.0f),
+        clampF(std::isfinite(y) ? y : 100.0f, 0.001f, 1000.0f),
+        clampF(std::isfinite(z) ? z : 100.0f, 0.001f, 1000.0f));
+}
+
+void recalculateMeshBounds(ImportedMeshData& mesh)
+{
+    if (mesh.vertices.empty()) {
+        mesh.boundsMin = Vec3();
+        mesh.boundsMax = Vec3();
+        return;
+    }
+
+    Vec3 min = mesh.vertices[0];
+    Vec3 max = min;
+    for (const Vec3& vertex : mesh.vertices) {
+        min.x = std::min(min.x, vertex.x);
+        min.y = std::min(min.y, vertex.y);
+        min.z = std::min(min.z, vertex.z);
+        max.x = std::max(max.x, vertex.x);
+        max.y = std::max(max.y, vertex.y);
+        max.z = std::max(max.z, vertex.z);
+    }
+
+    mesh.boundsMin = min;
+    mesh.boundsMax = max;
+}
+
+void centerAndScaleImportedMesh(ImportedMeshData& mesh, const Vec3& scalePercent)
+{
+    recalculateMeshBounds(mesh);
+    Vec3 center = (mesh.boundsMin + mesh.boundsMax) * 0.5f;
+    Vec3 scale(scalePercent.x * 0.01f, scalePercent.y * 0.01f, scalePercent.z * 0.01f);
+    for (Vec3& vertex : mesh.vertices) {
+        vertex.x = (vertex.x - center.x) * scale.x;
+        vertex.y = (vertex.y - center.y) * scale.y;
+        vertex.z = (vertex.z - center.z) * scale.z;
+    }
+
+    recalculateMeshBounds(mesh);
+}
+
+bool readBinaryStl(const std::string& path, uint32_t triangleCount, ImportedMeshData& mesh)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+
+    file.seekg(84, std::ios::beg);
+    std::array<unsigned char, 50> triangleBytes{};
+    mesh.vertices.reserve(static_cast<size_t>(triangleCount) * 3);
+    mesh.triangleIndices.reserve(static_cast<size_t>(triangleCount) * 3);
+    for (uint32_t triangle = 0; triangle < triangleCount; ++triangle) {
+        if (!file.read(reinterpret_cast<char*>(triangleBytes.data()), triangleBytes.size())) {
+            return false;
+        }
+
+        int baseIndex = static_cast<int>(mesh.vertices.size());
+        for (int vertex = 0; vertex < 3; ++vertex) {
+            const unsigned char* p = triangleBytes.data() + 12 + vertex * 12;
+            mesh.vertices.emplace_back(readF32Le(p), readF32Le(p + 4), readF32Le(p + 8));
+            mesh.triangleIndices.push_back(baseIndex + vertex);
+        }
+    }
+
+    return true;
+}
+
+bool readAsciiStl(const std::string& path, ImportedMeshData& mesh)
+{
+    std::ifstream file(path);
+    if (!file) {
+        return false;
+    }
+
+    std::string token;
+    int facetVertexCount = 0;
+    int baseIndex = 0;
+    while (file >> token) {
+        if (token != "vertex") {
+            continue;
+        }
+
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        if (!(file >> x >> y >> z)) {
+            return false;
+        }
+
+        if (facetVertexCount == 0) {
+            baseIndex = static_cast<int>(mesh.vertices.size());
+        }
+
+        mesh.vertices.emplace_back(x, y, z);
+        ++facetVertexCount;
+        if (facetVertexCount == 3) {
+            mesh.triangleIndices.push_back(baseIndex);
+            mesh.triangleIndices.push_back(baseIndex + 1);
+            mesh.triangleIndices.push_back(baseIndex + 2);
+            facetVertexCount = 0;
+        }
+    }
+
+    return facetVertexCount == 0;
+}
+
+bool parseImportedStlFile(const std::string& path, const Vec3& scalePercent, ImportedMeshData& mesh)
+{
+    mesh = ImportedMeshData();
+    if (path.empty()) {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> cacheLock(gImportCacheMutex);
+        if (gImportedStlCache.valid &&
+            gImportedStlCache.path == path &&
+            gImportedStlCache.scaleX == scalePercent.x &&
+            gImportedStlCache.scaleY == scalePercent.y &&
+            gImportedStlCache.scaleZ == scalePercent.z) {
+            mesh = gImportedStlCache.mesh;
+            return true;
+        }
+    }
+
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        return false;
+    }
+
+    std::streamoff fileSize = file.tellg();
+    if (fileSize < 84) {
+        return false;
+    }
+
+    std::array<unsigned char, 4> countBytes{};
+    file.seekg(80, std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(countBytes.data()), countBytes.size())) {
+        return false;
+    }
+
+    uint32_t binaryTriangleCount = readU32Le(countBytes.data());
+    const std::streamoff expectedBinarySize =
+        84 + static_cast<std::streamoff>(binaryTriangleCount) * 50;
+    bool loaded = expectedBinarySize == fileSize
+        ? readBinaryStl(path, binaryTriangleCount, mesh)
+        : readAsciiStl(path, mesh);
+
+    if (!loaded || mesh.vertices.empty() || mesh.triangleIndices.size() < 3) {
+        return false;
+    }
+
+    centerAndScaleImportedMesh(mesh, scalePercent);
+
+    {
+        std::lock_guard<std::mutex> cacheLock(gImportCacheMutex);
+        gImportedStlCache.path = path;
+        gImportedStlCache.scaleX = scalePercent.x;
+        gImportedStlCache.scaleY = scalePercent.y;
+        gImportedStlCache.scaleZ = scalePercent.z;
+        gImportedStlCache.mesh = mesh;
+        gImportedStlCache.valid = true;
+    }
+
+    return true;
 }
 
 int sampleIdx(int x, int y, int z)
@@ -359,6 +569,50 @@ void initializeStockSdf()
 }
 
 #if defined(SDF_USE_OPENVDB)
+bool initializeImportedMeshSdfFromOpenVdb(
+    const std::vector<openvdb::Vec3s>& points,
+    const std::vector<openvdb::Vec3I>& triangles)
+{
+    if (!gState.initialized || points.empty() || triangles.empty()) {
+        return false;
+    }
+
+    try {
+        openvdb::initialize();
+        const auto transform = openvdb::math::Transform::createLinearTransform(gState.voxelSize);
+        openvdb::FloatGrid::Ptr meshGrid = openvdb::tools::meshToLevelSet<openvdb::FloatGrid>(
+            *transform,
+            points,
+            triangles,
+            3.0f);
+        if (!meshGrid) {
+            return false;
+        }
+
+        meshGrid->setName("imported_blank_sdf");
+        openvdb::FloatGrid::ConstAccessor accessor = meshGrid->getConstAccessor();
+        openvdb::tools::GridSampler<
+            openvdb::FloatGrid::ConstAccessor,
+            openvdb::tools::BoxSampler> sampler(accessor, meshGrid->transform());
+        for (int z = 0; z < gState.sampleD; ++z) {
+            for (int y = 0; y < gState.sampleH; ++y) {
+                for (int x = 0; x < gState.sampleW; ++x) {
+                    Vec3 p = samplePoint(x, y, z);
+                    gState.sdf[static_cast<size_t>(sampleIdx(x, y, z))] =
+                        static_cast<float>(sampler.wsSample(openvdb::Vec3d(p.x, p.y, p.z)));
+                }
+            }
+        }
+
+        gState.workpieceGrid = meshGrid;
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
 void initializeOpenVdbGrid()
 {
     openvdb::initialize();
@@ -1278,7 +1532,9 @@ float sampleCutOperationExactUnlocked(const CutOperation& operation, const Vec3&
 
 float continuousSdfSampleUnlocked(const Vec3& p, bool exactMeshHistory)
 {
-    float value = stockSdf(p);
+    float value = gState.blankShape == BlankShapeImportedMesh
+        ? denseSdfSampleUnlocked(p)
+        : stockSdf(p);
     bool exactMeshOperationCoversPoint = false;
     for (const CutOperation& operation : gState.cutHistory) {
         if (exactMeshHistory &&
@@ -3175,20 +3431,65 @@ SDF_EXPORT int sdf_openvdb_active_voxel_count()
 #endif
 }
 
-SDF_EXPORT int sdf_set_blank_mesh(
+int setImportedBlankMeshUnlocked(std::shared_ptr<MeshCutterGeometry> blankMesh)
+{
+    if (!readyUnlocked() || !blankMesh || blankMesh->vertices.empty() || blankMesh->triangleIndices.size() < 3) {
+        return 0;
+    }
+
+#if defined(SDF_USE_OPENVDB)
+    std::vector<openvdb::Vec3s> points;
+    points.reserve(blankMesh->vertices.size());
+    for (const Vec3& p : blankMesh->vertices) {
+        points.emplace_back(p.x, p.y, p.z);
+    }
+
+    std::vector<openvdb::Vec3I> triangles;
+    triangles.reserve(blankMesh->triangleIndices.size() / 3);
+    for (size_t i = 0; i + 2 < blankMesh->triangleIndices.size(); i += 3) {
+        triangles.emplace_back(
+            blankMesh->triangleIndices[i],
+            blankMesh->triangleIndices[i + 1],
+            blankMesh->triangleIndices[i + 2]);
+    }
+#endif
+
+    if (!meshFitsStockEnvelope(*blankMesh)) {
+        return 0;
+    }
+
+    gState.blankMesh = blankMesh;
+    gState.blankShape = BlankShapeImportedMesh;
+    gState.cutHistory.clear();
+    gState.removalApplied = false;
+    gState.connectivityReady = false;
+    gState.connectivityInProgress = false;
+    gState.islandsFound = false;
+    gState.pendingRemovalCount = 0;
+    gState.pendingRemovalIndices.clear();
+#if defined(SDF_USE_OPENVDB)
+    if (!initializeImportedMeshSdfFromOpenVdb(points, triangles)) {
+        gState.workpieceGrid.reset();
+        initializeStockSdf();
+    }
+#else
+    initializeStockSdf();
+#endif
+    bumpMaterialRevisionUnlocked();
+    return 1;
+}
+
+std::shared_ptr<MeshCutterGeometry> createImportedBlankMeshFromArrays(
     const float* vertices,
     int vertexCount,
     const int* triangleIndices,
     int indexCount)
 {
-    joinConnectivityThread();
-    std::lock_guard<std::mutex> lock(gMutex);
-    if (!readyUnlocked() ||
-        vertices == nullptr ||
+    if (vertices == nullptr ||
         triangleIndices == nullptr ||
         vertexCount <= 0 ||
         indexCount < 3) {
-        return 0;
+        return nullptr;
     }
 
     auto blankMesh = std::make_shared<MeshCutterGeometry>();
@@ -3224,32 +3525,115 @@ SDF_EXPORT int sdf_set_blank_mesh(
     }
 
     if (validTriangleIndices.empty()) {
-        return 0;
+        return nullptr;
     }
 
     blankMesh->triangleIndices = std::move(validTriangleIndices);
     blankMesh->boundsMin = boundsMin;
     blankMesh->boundsMax = boundsMax;
     blankMesh->shellRadius = 0.0f;
-    if (!meshFitsStockEnvelope(*blankMesh)) {
+    return blankMesh;
+}
+
+std::shared_ptr<MeshCutterGeometry> createImportedBlankMeshFromParsedStl(const ImportedMeshData& mesh)
+{
+    if (mesh.vertices.empty() || mesh.triangleIndices.size() < 3) {
+        return nullptr;
+    }
+
+    auto blankMesh = std::make_shared<MeshCutterGeometry>();
+    blankMesh->vertices = mesh.vertices;
+    blankMesh->triangleIndices = mesh.triangleIndices;
+    blankMesh->boundsMin = mesh.boundsMin;
+    blankMesh->boundsMax = mesh.boundsMax;
+    blankMesh->shellRadius = 0.0f;
+    return blankMesh;
+}
+
+SDF_EXPORT int sdf_get_stl_bounds(
+    const char* filePath,
+    float scalePercentX,
+    float scalePercentY,
+    float scalePercentZ,
+    float* bounds6,
+    int* triangleCount)
+{
+    if (bounds6 == nullptr || triangleCount == nullptr || filePath == nullptr) {
         return 0;
     }
 
-    gState.blankMesh = blankMesh;
-    gState.blankShape = BlankShapeImportedMesh;
-    gState.cutHistory.clear();
-    gState.removalApplied = false;
-    gState.connectivityReady = false;
-    gState.connectivityInProgress = false;
-    gState.islandsFound = false;
-    gState.pendingRemovalCount = 0;
-    gState.pendingRemovalIndices.clear();
-    initializeStockSdf();
-    bumpMaterialRevisionUnlocked();
-#if defined(SDF_USE_OPENVDB)
-    gState.workpieceGrid.reset();
-#endif
+    ImportedMeshData mesh;
+    if (!parseImportedStlFile(
+            std::string(filePath),
+            sanitizeImportedScalePercent(scalePercentX, scalePercentY, scalePercentZ),
+            mesh)) {
+        return 0;
+    }
+
+    bounds6[0] = mesh.boundsMin.x;
+    bounds6[1] = mesh.boundsMin.y;
+    bounds6[2] = mesh.boundsMin.z;
+    bounds6[3] = mesh.boundsMax.x;
+    bounds6[4] = mesh.boundsMax.y;
+    bounds6[5] = mesh.boundsMax.z;
+    *triangleCount = static_cast<int>(mesh.triangleIndices.size() / 3);
     return 1;
+}
+
+SDF_EXPORT int sdf_set_blank_stl_file(
+    const char* filePath,
+    float scalePercentX,
+    float scalePercentY,
+    float scalePercentZ,
+    float* bounds6,
+    int* triangleCount)
+{
+    joinConnectivityThread();
+    std::lock_guard<std::mutex> lock(gMutex);
+    if (!readyUnlocked() || filePath == nullptr) {
+        return 0;
+    }
+
+    ImportedMeshData mesh;
+    if (!parseImportedStlFile(
+            std::string(filePath),
+            sanitizeImportedScalePercent(scalePercentX, scalePercentY, scalePercentZ),
+            mesh)) {
+        return 0;
+    }
+
+    std::shared_ptr<MeshCutterGeometry> blankMesh = createImportedBlankMeshFromParsedStl(mesh);
+    if (!setImportedBlankMeshUnlocked(blankMesh)) {
+        return 0;
+    }
+
+    if (bounds6 != nullptr) {
+        bounds6[0] = mesh.boundsMin.x;
+        bounds6[1] = mesh.boundsMin.y;
+        bounds6[2] = mesh.boundsMin.z;
+        bounds6[3] = mesh.boundsMax.x;
+        bounds6[4] = mesh.boundsMax.y;
+        bounds6[5] = mesh.boundsMax.z;
+    }
+
+    if (triangleCount != nullptr) {
+        *triangleCount = static_cast<int>(mesh.triangleIndices.size() / 3);
+    }
+
+    return 1;
+}
+
+SDF_EXPORT int sdf_set_blank_mesh(
+    const float* vertices,
+    int vertexCount,
+    const int* triangleIndices,
+    int indexCount)
+{
+    joinConnectivityThread();
+    std::lock_guard<std::mutex> lock(gMutex);
+    std::shared_ptr<MeshCutterGeometry> blankMesh =
+        createImportedBlankMeshFromArrays(vertices, vertexCount, triangleIndices, indexCount);
+    return setImportedBlankMeshUnlocked(blankMesh);
 }
 
 SDF_EXPORT void sdf_clear_blank_mesh()

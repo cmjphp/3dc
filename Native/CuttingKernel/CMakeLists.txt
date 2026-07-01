@@ -8,25 +8,25 @@ endif()
 
 option(CUTTING_KERNEL_USE_OPENVDB "Build the cutting kernel with OpenVDB support" ON)
 
-add_library(cutting_kernel_v44 SHARED
+add_library(cutting_kernel_v45 SHARED
     src/cutting_kernel.cpp
 )
 
-target_compile_features(cutting_kernel_v44 PRIVATE cxx_std_17)
-target_compile_options(cutting_kernel_v44 PRIVATE
+target_compile_features(cutting_kernel_v45 PRIVATE cxx_std_17)
+target_compile_options(cutting_kernel_v45 PRIVATE
     -fvisibility=hidden
 )
-target_include_directories(cutting_kernel_v44 PRIVATE
+target_include_directories(cutting_kernel_v45 PRIVATE
     include
 )
 
-set_target_properties(cutting_kernel_v44 PROPERTIES
-    OUTPUT_NAME "cutting_kernel_v44"
+set_target_properties(cutting_kernel_v45 PROPERTIES
+    OUTPUT_NAME "cutting_kernel_v45"
     PREFIX ""
 )
 
 if(APPLE)
-    set_target_properties(cutting_kernel_v44 PROPERTIES
+    set_target_properties(cutting_kernel_v45 PROPERTIES
         MACOSX_RPATH ON
         INSTALL_RPATH "/opt/homebrew/lib;/opt/homebrew/opt/openvdb/lib"
         BUILD_WITH_INSTALL_RPATH ON
@@ -37,6 +37,6 @@ if(CUTTING_KERNEL_USE_OPENVDB)
     list(APPEND CMAKE_MODULE_PATH "/opt/homebrew/opt/openvdb/lib/cmake/OpenVDB")
     find_package(OpenVDB REQUIRED)
 
-    target_compile_definitions(cutting_kernel_v44 PRIVATE SDF_USE_OPENVDB=1)
-    target_link_libraries(cutting_kernel_v44 PRIVATE OpenVDB::openvdb)
+    target_compile_definitions(cutting_kernel_v45 PRIVATE SDF_USE_OPENVDB=1)
+    target_link_libraries(cutting_kernel_v45 PRIVATE OpenVDB::openvdb)
 endif()

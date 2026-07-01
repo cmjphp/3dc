@@ -3,7 +3,7 @@
 Native C/C++ cutting core used by Unity through `Assets/Scripts/Cutting/SdfNativePlugin.cs`.
 
 - `src/cutting_kernel.cpp` owns the workpiece SDF, initial blank SDF shapes, selected cutter mesh upload, swept cutter subtraction, SDF readback, and connectivity entry points.
-- `build_macos.sh` builds `Assets/Plugins/cutting_kernel_v44.dylib`.
+- `build_macos.sh` builds `Assets/Plugins/cutting_kernel_v45.dylib`.
 - Unity C# is only the UI/rendering/interaction bridge. It calls `sdf_cut_selected_cutter()` and reads back native SDF data; it does not perform concrete cutting.
 - GPU acceleration must be added behind this native ABI as a C/C++ compute backend. The current implementation reports the CPU backend as active; Unity-side ComputeShaders are limited to display-buffer synchronization and rendering.
 

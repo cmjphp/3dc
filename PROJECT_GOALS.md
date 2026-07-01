@@ -13,6 +13,7 @@ This project is a real-time CNC machining simulation and measurement tool.
 - The stock/workpiece blank is user-defined, with each axis allowed up to 1000 mm, so the maximum stock envelope is 1000 x 1000 x 1000 mm.
 - Initial workpiece shapes must include at least box, cylinder, tube, half-tube, and third-party imported 3D model blanks, without exceeding the user-defined stock envelope.
 - Third-party imported initial workpiece models must be rejected if any local axis exceeds 1000 mm; do not silently scale, crop, clamp, or replace them with a simpler fallback.
+- Third-party model parsing/conversion for machinable imported blanks belongs in native C/C++; Unity C# may pass file paths, scale percentages, and UI state only.
 - Performance work must not substitute a forced fixed cutting window for the user's stock dimensions.
 - The machined workpiece must remain measurable after cutting.
 - Measurement precision must not be worse than 0.001 mm.

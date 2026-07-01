@@ -80,6 +80,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     [Min(0f)] public float blankInnerRadiusMm = 20f;
     public GameObject importedBlankModelRoot;
     public string importedBlankModelResourcePath;
+    public string importedBlankFilePath;
     public Vector3 importedBlankScalePercent = Vector3.one * 100f;
     public WorkpieceSurfaceMode surfaceMode = WorkpieceSurfaceMode.SmoothSdf;
     public bool updateCollider;
@@ -366,8 +367,15 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     {
         blankShape = requestedShape;
         blankInnerRadiusMm = Mathf.Max(0f, requestedInnerRadiusMm);
-        importedBlankModelResourcePath = SanitizeResourcePath(requestedImportedResourcePath);
-        if (!string.IsNullOrEmpty(importedBlankModelResourcePath))
+        string importedPath = requestedImportedResourcePath ?? string.Empty;
+        importedBlankFilePath = ImportedStlMeshLoader.IsStlPath(importedPath)
+            ? importedPath.Trim().Replace('\\', '/')
+            : string.Empty;
+        importedBlankModelResourcePath = string.IsNullOrEmpty(importedBlankFilePath)
+            ? SanitizeResourcePath(importedPath)
+            : string.Empty;
+        if (!string.IsNullOrEmpty(importedBlankModelResourcePath) ||
+            !string.IsNullOrEmpty(importedBlankFilePath))
         {
             importedBlankModelRoot = null;
         }
@@ -375,8 +383,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         if (blankShape == WorkpieceBlankShape.ImportedMesh)
         {
             importedBlankScalePercent = SanitizeImportedScalePercent(requestedSizeMm);
-            GameObject importedRoot = ResolveImportedBlankModelRoot();
-            if (TryResolveImportedBlankSize(importedRoot, importedBlankScalePercent, out Vector3 importedSize))
+            if (TryResolveImportedBlankSize(importedBlankScalePercent, out Vector3 importedSize))
             {
                 workpieceSizeMm = SanitizeWorkpieceSize(importedSize);
             }
@@ -941,6 +948,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         workpiece.blankShape = blankShape;
         workpiece.blankInnerRadius = Mathf.Max(0f, blankInnerRadiusMm);
         workpiece.importedBlankMeshRoot = ResolveImportedBlankModelRoot();
+        workpiece.importedBlankFilePath = importedBlankFilePath;
         workpiece.importedBlankScalePercent = SanitizeImportedScalePercent(importedBlankScalePercent);
         workpiece.surfaceMode = surfaceMode;
         workpiece.asyncSmoothMeshRebuild = true;
@@ -1023,11 +1031,35 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     }
 
     private bool TryResolveImportedBlankSize(
-        GameObject importedRoot,
         Vector3 scalePercent,
         out Vector3 sizeMm)
     {
         sizeMm = Vector3.zero;
+        if (ImportedStlMeshLoader.IsStlPath(importedBlankFilePath))
+        {
+            float[] stlBounds6 = new float[6];
+            if (SdfNativePlugin.sdf_get_stl_bounds(
+                    importedBlankFilePath,
+                    scalePercent.x,
+                    scalePercent.y,
+                    scalePercent.z,
+                    stlBounds6,
+                    out int triangleCount) == 0)
+            {
+                Debug.LogWarning($"Imported STL '{importedBlankFilePath}' could not be resolved by the native parser.");
+                return false;
+            }
+
+            Vector3 min = new Vector3(stlBounds6[0], stlBounds6[1], stlBounds6[2]);
+            Vector3 max = new Vector3(stlBounds6[3], stlBounds6[4], stlBounds6[5]);
+            sizeMm = max - min;
+            Debug.Log(
+                $"IMPORTED_STL_NATIVE_BOUNDS path={importedBlankFilePath} " +
+                $"triangles={triangleCount:n0} bounds=({min}..{max}) size={sizeMm}");
+            return sizeMm.x > 0f && sizeMm.y > 0f && sizeMm.z > 0f;
+        }
+
+        GameObject importedRoot = ResolveImportedBlankModelRoot();
         if (importedRoot == null)
         {
             return false;
