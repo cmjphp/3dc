@@ -9,7 +9,7 @@ public static class SdfNativePlugin
 {
     // Bump the filename when the native implementation changes so an open
     // Unity editor does not keep calling the already-loaded dylib image.
-    private const string DllName = "cutting_kernel_v43";
+    private const string DllName = "cutting_kernel_v44";
     public const string PluginName = DllName;
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]

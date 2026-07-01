@@ -43,7 +43,9 @@ public sealed class WorkpieceMeasurement : MonoBehaviour
         out WorkpieceMeasurementHit hit)
     {
         hit = default;
-        if (!EnsureWorkpiece() || worldDirection.sqrMagnitude <= 0.000000000001f)
+        if (!EnsureWorkpiece() ||
+            !workpiece.IsNativeSdfReady ||
+            worldDirection.sqrMagnitude <= 0.000000000001f)
         {
             return false;
         }
@@ -120,7 +122,9 @@ public sealed class WorkpieceMeasurement : MonoBehaviour
         out WorkpieceThicknessMeasurement measurement)
     {
         measurement = default;
-        if (!EnsureWorkpiece() || worldDirection.sqrMagnitude <= 0.000000000001f)
+        if (!EnsureWorkpiece() ||
+            !workpiece.IsNativeSdfReady ||
+            worldDirection.sqrMagnitude <= 0.000000000001f)
         {
             return false;
         }

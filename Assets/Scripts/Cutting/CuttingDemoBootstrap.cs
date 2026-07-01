@@ -79,6 +79,8 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     public WorkpieceBlankShape blankShape = WorkpieceBlankShape.Box;
     [Min(0f)] public float blankInnerRadiusMm = 20f;
     public GameObject importedBlankModelRoot;
+    public string importedBlankModelResourcePath;
+    public Vector3 importedBlankScalePercent = Vector3.one * 100f;
     public WorkpieceSurfaceMode surfaceMode = WorkpieceSurfaceMode.SmoothSdf;
     public bool updateCollider;
     [Min(100)] public int smoothRebuildCellsPerFrame = 2500;
@@ -143,6 +145,8 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     private int cutterProfileRadiusSampleCount;
     private int cutterAngularProfileAxialSampleCount;
     private int cutterAngularProfileAngleSampleCount;
+    private WorkpieceVoxel activeWorkpiece;
+    private CutterController activeCutter;
 
     private void Start()
     {
@@ -168,17 +172,19 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             ApplyPrecisionTarget();
         }
 
-        WorkpieceVoxel existingWorkpiece = Object.FindFirstObjectByType<WorkpieceVoxel>();
+        WorkpieceVoxel existingWorkpiece = ResolveActiveWorkpiece();
         if (skipIfWorkpieceExists && existingWorkpiece != null)
         {
             ApplyWorkpieceSettings(existingWorkpiece);
             existingWorkpiece.ResetWorkpiece();
+            activeWorkpiece = existingWorkpiece;
             ConfigureExistingCutter(existingWorkpiece);
             ConfigureCamera(existingWorkpiece);
             return;
         }
 
         WorkpieceVoxel workpiece = CreateWorkpiece();
+        activeWorkpiece = workpiece;
         CreateCutter(workpiece);
         ConfigureCamera(workpiece);
         EnsureLight();
@@ -333,20 +339,82 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
 
     public void SetWorkpieceSizeMm(Vector3 requestedSizeMm)
     {
-        workpieceSizeMm = SanitizeWorkpieceSize(requestedSizeMm);
+        SetWorkpieceDefinition(
+            requestedSizeMm,
+            blankShape,
+            blankInnerRadiusMm,
+            importedBlankModelResourcePath);
+    }
+
+    public void SetWorkpieceBlank(
+        WorkpieceBlankShape requestedShape,
+        float requestedInnerRadiusMm,
+        string requestedImportedResourcePath)
+    {
+        SetWorkpieceDefinition(
+            workpieceSizeMm,
+            requestedShape,
+            requestedInnerRadiusMm,
+            requestedImportedResourcePath);
+    }
+
+    public bool SetWorkpieceDefinition(
+        Vector3 requestedSizeMm,
+        WorkpieceBlankShape requestedShape,
+        float requestedInnerRadiusMm,
+        string requestedImportedResourcePath)
+    {
+        blankShape = requestedShape;
+        blankInnerRadiusMm = Mathf.Max(0f, requestedInnerRadiusMm);
+        importedBlankModelResourcePath = SanitizeResourcePath(requestedImportedResourcePath);
+        if (!string.IsNullOrEmpty(importedBlankModelResourcePath))
+        {
+            importedBlankModelRoot = null;
+        }
+
+        if (blankShape == WorkpieceBlankShape.ImportedMesh)
+        {
+            importedBlankScalePercent = SanitizeImportedScalePercent(requestedSizeMm);
+            GameObject importedRoot = ResolveImportedBlankModelRoot();
+            if (TryResolveImportedBlankSize(importedRoot, importedBlankScalePercent, out Vector3 importedSize))
+            {
+                workpieceSizeMm = SanitizeWorkpieceSize(importedSize);
+            }
+            else
+            {
+                Debug.LogWarning(
+                    $"Imported blank '{importedBlankModelResourcePath}' could not be resolved or has no readable bounds.");
+                return false;
+            }
+        }
+        else
+        {
+            workpieceSizeMm = SanitizeWorkpieceSize(requestedSizeMm);
+        }
+
         ApplyPrecisionTarget();
 
-        WorkpieceVoxel workpiece = Object.FindFirstObjectByType<WorkpieceVoxel>();
+        WorkpieceVoxel workpiece = ResolveActiveWorkpiece();
         if (workpiece == null)
         {
             CreateDemo();
-            return;
+            workpiece = ResolveActiveWorkpiece();
+            return workpiece != null &&
+                (surfaceMode != WorkpieceSurfaceMode.SmoothSdf || workpiece.IsNativeSdfReady);
         }
 
         ApplyWorkpieceSettings(workpiece);
         workpiece.ResetWorkpiece();
+        activeWorkpiece = workpiece;
+        bool ready = surfaceMode != WorkpieceSurfaceMode.SmoothSdf || workpiece.IsNativeSdfReady;
+        if (ready)
+        {
+            workpiece.RequestRebuildMesh();
+        }
+
         ConfigureExistingCutter(workpiece);
         ConfigureCamera(workpiece);
+        return ready;
     }
 
     public void SetCutterParameters(
@@ -368,7 +436,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             MinCutterSpeedMmPerSecond,
             MaxCutterSpeedMmPerSecond);
 
-        CutterController cutter = Object.FindFirstObjectByType<CutterController>();
+        CutterController cutter = ResolveActiveCutter();
         if (cutter == null)
         {
             return;
@@ -390,7 +458,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     {
         cutterDirectionEuler = SanitizeCutterDirectionEuler(requestedEuler);
 
-        CutterController cutter = Object.FindFirstObjectByType<CutterController>();
+        CutterController cutter = ResolveActiveCutter();
         if (cutter == null)
         {
             return;
@@ -806,7 +874,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             return;
         }
 
-        CutterController cutter = Object.FindFirstObjectByType<CutterController>();
+        CutterController cutter = ResolveActiveCutter();
         if (cutter == null)
         {
             return;
@@ -820,6 +888,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cutter.ResetCutSweep();
         SetupCutterVisual(cutter.gameObject);
         RefreshCutterProfileFromVisual(cutter);
+        activeCutter = cutter;
     }
 
     private void EnsureWorkpieceSizeUi()
@@ -857,6 +926,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         ApplyWorkpieceSettings(workpiece);
         workpiece.initializeOnStart = false;
         workpiece.ResetWorkpiece();
+        activeWorkpiece = workpiece;
 
         return workpiece;
     }
@@ -870,11 +940,12 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         workpiece.maxAllocatedSdfSamples = Mathf.Max(100000, maxSdfSamples);
         workpiece.blankShape = blankShape;
         workpiece.blankInnerRadius = Mathf.Max(0f, blankInnerRadiusMm);
-        workpiece.importedBlankMeshRoot = importedBlankModelRoot;
+        workpiece.importedBlankMeshRoot = ResolveImportedBlankModelRoot();
+        workpiece.importedBlankScalePercent = SanitizeImportedScalePercent(importedBlankScalePercent);
         workpiece.surfaceMode = surfaceMode;
         workpiece.asyncSmoothMeshRebuild = true;
         workpiece.smoothRebuildCellsPerFrame = Mathf.Max(100, smoothRebuildCellsPerFrame);
-        workpiece.useChunkedSmoothMesh = useChunkedSmoothMesh;
+        workpiece.useChunkedSmoothMesh = useChunkedSmoothMesh && !useGpuSurfaceRendering;
         workpiece.chunkSize = Mathf.Max(2, chunkSize);
         workpiece.chunkRebuildsPerFrame = Mathf.Max(1, chunkRebuildsPerFrame);
         workpiece.dirtyChunkNeighborShell = Mathf.Max(0, dirtyChunkNeighborShell);
@@ -902,6 +973,128 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         workpiece.initializeOnStart = false;
         workpiece.SetProfileSegmentCount(cutterProfileSegmentCount);
         ConfigureWorkpieceMeasurement(workpiece);
+    }
+
+    private GameObject ResolveImportedBlankModelRoot()
+    {
+        if (importedBlankModelRoot != null)
+        {
+            return importedBlankModelRoot;
+        }
+
+        string resourcePath = SanitizeResourcePath(importedBlankModelResourcePath);
+        if (string.IsNullOrEmpty(resourcePath))
+        {
+            return null;
+        }
+
+        return Resources.Load<GameObject>(resourcePath);
+    }
+
+    private static string SanitizeResourcePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        string sanitized = path.Trim().Replace('\\', '/');
+        const string resourcesPrefix = "Assets/Resources/";
+        if (sanitized.StartsWith(resourcesPrefix, System.StringComparison.OrdinalIgnoreCase))
+        {
+            sanitized = sanitized.Substring(resourcesPrefix.Length);
+        }
+
+        int extensionIndex = sanitized.LastIndexOf('.');
+        if (extensionIndex > 0)
+        {
+            sanitized = sanitized.Substring(0, extensionIndex);
+        }
+
+        return sanitized;
+    }
+
+    private static Vector3 SanitizeImportedScalePercent(Vector3 scalePercent)
+    {
+        return new Vector3(
+            Mathf.Clamp(scalePercent.x, 0.001f, 1000f),
+            Mathf.Clamp(scalePercent.y, 0.001f, 1000f),
+            Mathf.Clamp(scalePercent.z, 0.001f, 1000f));
+    }
+
+    private bool TryResolveImportedBlankSize(
+        GameObject importedRoot,
+        Vector3 scalePercent,
+        out Vector3 sizeMm)
+    {
+        sizeMm = Vector3.zero;
+        if (importedRoot == null)
+        {
+            return false;
+        }
+
+        bool hasBounds = false;
+        Bounds bounds = default;
+        MeshFilter[] filters = importedRoot.GetComponentsInChildren<MeshFilter>(true);
+        for (int i = 0; i < filters.Length; i++)
+        {
+            EncapsulateMeshBounds(importedRoot.transform, filters[i].transform, filters[i].sharedMesh, ref bounds, ref hasBounds);
+        }
+
+        SkinnedMeshRenderer[] skinnedRenderers = importedRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+        for (int i = 0; i < skinnedRenderers.Length; i++)
+        {
+            EncapsulateMeshBounds(importedRoot.transform, skinnedRenderers[i].transform, skinnedRenderers[i].sharedMesh, ref bounds, ref hasBounds);
+        }
+
+        if (!hasBounds)
+        {
+            return false;
+        }
+
+        Vector3 scale = SanitizeImportedScalePercent(scalePercent) * 0.01f;
+        sizeMm = Vector3.Scale(bounds.size, scale);
+        return sizeMm.x > 0f && sizeMm.y > 0f && sizeMm.z > 0f;
+    }
+
+    private static void EncapsulateMeshBounds(
+        Transform root,
+        Transform meshTransform,
+        Mesh mesh,
+        ref Bounds bounds,
+        ref bool hasBounds)
+    {
+        if (root == null || meshTransform == null || mesh == null)
+        {
+            return;
+        }
+
+        Bounds meshBounds = mesh.bounds;
+        Vector3 min = meshBounds.min;
+        Vector3 max = meshBounds.max;
+        for (int x = 0; x <= 1; x++)
+        {
+            for (int y = 0; y <= 1; y++)
+            {
+                for (int z = 0; z <= 1; z++)
+                {
+                    Vector3 localCorner = new Vector3(
+                        x == 0 ? min.x : max.x,
+                        y == 0 ? min.y : max.y,
+                        z == 0 ? min.z : max.z);
+                    Vector3 rootLocal = root.InverseTransformPoint(meshTransform.TransformPoint(localCorner));
+                    if (!hasBounds)
+                    {
+                        bounds = new Bounds(rootLocal, Vector3.zero);
+                        hasBounds = true;
+                    }
+                    else
+                    {
+                        bounds.Encapsulate(rootLocal);
+                    }
+                }
+            }
+        }
     }
 
     private void ApplyDefaultWorkpieceMaterial(WorkpieceVoxel workpiece)
@@ -969,11 +1162,12 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cutter.ResetCutSweep();
         SetupCutterVisual(cutterObject);
         RefreshCutterProfileFromVisual(cutter);
+        activeCutter = cutter;
     }
 
     private void ConfigureExistingCutter(WorkpieceVoxel workpiece)
     {
-        CutterController cutter = Object.FindFirstObjectByType<CutterController>();
+        CutterController cutter = ResolveActiveCutter();
         if (cutter == null)
         {
             CreateCutter(workpiece);
@@ -986,6 +1180,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cutter.ResetCutSweep();
         SetupCutterVisual(cutter.gameObject);
         RefreshCutterProfileFromVisual(cutter);
+        activeCutter = cutter;
     }
 
     private Vector3 GetCutterStartWorldPosition(WorkpieceVoxel workpiece)
@@ -1030,7 +1225,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         int segmentCount = Mathf.Max(2, cutterProfileSegmentCount);
         if (workpiece == null)
         {
-            workpiece = Object.FindFirstObjectByType<WorkpieceVoxel>();
+            workpiece = ResolveActiveWorkpiece();
         }
 
         if (workpiece != null)
@@ -1979,7 +2174,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cameraController.maxDistance = framingDistance * 4f;
         cameraController.zoomStep = framingDistance * 0.05f;
         cameraController.keyboardPanSpeed = boundingRadius * 0.5f;
-        CutterController cutter = Object.FindFirstObjectByType<CutterController>();
+        CutterController cutter = ResolveActiveCutter();
         float cutterFocusDistance = Mathf.Max(
             cutterRadius * 20f,
             workpiece.voxelSize * 100f);
@@ -2002,6 +2197,28 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         light.type = LightType.Directional;
         light.intensity = 1.3f;
         lightObject.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
+    }
+
+    private WorkpieceVoxel ResolveActiveWorkpiece()
+    {
+        if (activeWorkpiece != null)
+        {
+            return activeWorkpiece;
+        }
+
+        activeWorkpiece = Object.FindFirstObjectByType<WorkpieceVoxel>();
+        return activeWorkpiece;
+    }
+
+    private CutterController ResolveActiveCutter()
+    {
+        if (activeCutter != null)
+        {
+            return activeCutter;
+        }
+
+        activeCutter = Object.FindFirstObjectByType<CutterController>();
+        return activeCutter;
     }
 
     private static Material CreateCompatibleMaterial(string materialName, Color color)

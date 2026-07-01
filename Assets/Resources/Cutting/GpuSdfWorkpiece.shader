@@ -137,14 +137,6 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 return lerp(c0, c1, t.z);
             }
 
-            float BoxSdf(float3 samplePosition, float3 boxCenter, float3 boxSize)
-            {
-                float3 voxelVector = float3(_VoxelSize, _VoxelSize, _VoxelSize);
-                float3 halfSize = max(boxSize * 0.5, voxelVector * 0.5);
-                float3 q = abs(samplePosition - boxCenter) - halfSize;
-                return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-            }
-
             float GetVisualProfileSample(VisualCutOperation operation, int index)
             {
                 if (index < 0 || index >= 32)
@@ -533,7 +525,15 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
 
             float SampleSdf(float3 localPoint)
             {
-                float fullWorkpiece = BoxSdf(localPoint, _DisplayCenter.xyz, _DisplaySize.xyz);
+                float3 detailHalfSize = _LocalSize.xyz * 0.5;
+                float3 voxelVector = float3(_VoxelSize, _VoxelSize, _VoxelSize);
+
+                if (any(abs(localPoint) > detailHalfSize + voxelVector))
+                {
+                    return 1000000.0;
+                }
+
+                float baseMaterial = SampleDetailSdf(localPoint);
                 bool nativeCutDetailContainsPoint = NativeCutDetailContains(localPoint);
                 float nativeCutDetail = nativeCutDetailContainsPoint
                     ? SampleNativeCutDetail(localPoint)
@@ -541,17 +541,7 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 float visualCuts = nativeCutDetailContainsPoint
                     ? -1000000.0
                     : SampleVisualCuts(localPoint);
-                float combinedWorkpiece = max(max(fullWorkpiece, visualCuts), nativeCutDetail);
-                float3 detailHalfSize = _LocalSize.xyz * 0.5;
-                float3 voxelVector = float3(_VoxelSize, _VoxelSize, _VoxelSize);
-
-                if (any(abs(localPoint) > detailHalfSize + voxelVector))
-                {
-                    return combinedWorkpiece;
-                }
-
-                float storedDetail = SampleDetailSdf(localPoint);
-                return max(combinedWorkpiece, storedDetail);
+                return max(max(baseMaterial, visualCuts), nativeCutDetail);
             }
 
             float3 GetSdfNormal(float3 localPoint)

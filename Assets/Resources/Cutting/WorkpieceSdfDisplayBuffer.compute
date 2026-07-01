@@ -1,4 +1,3 @@
-#pragma kernel InitializeBoxSdf
 #pragma kernel CopySdfRegion
 
 // Display-side GPU buffer helper only.
@@ -10,30 +9,6 @@ StructuredBuffer<float> _SdfRegionSamples;
 int3 _SampleSize;
 int3 _RegionMin;
 int3 _RegionSize;
-float3 _GridMin;
-float3 _LocalSize;
-float _VoxelSize;
-
-[numthreads(8, 8, 4)]
-void InitializeBoxSdf(uint3 id : SV_DispatchThreadID)
-{
-    int3 sample = int3(id);
-    if (sample.x >= _SampleSize.x || sample.y >= _SampleSize.y || sample.z >= _SampleSize.z)
-    {
-        return;
-    }
-
-    float3 samplePoint = _GridMin + (float3(sample) - 1.0) * _VoxelSize;
-    float halfVoxel = _VoxelSize * 0.5;
-    float3 halfSize = max(_LocalSize * 0.5 - halfVoxel, float3(halfVoxel, halfVoxel, halfVoxel));
-    float3 q = abs(samplePoint) - halfSize;
-    float3 outside = max(q, 0.0);
-    float inside = min(max(q.x, max(q.y, q.z)), 0.0);
-    float sdf = length(outside) + inside;
-
-    int index = sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
-    _SdfSamples[index] = sdf;
-}
 
 [numthreads(8, 8, 4)]
 void CopySdfRegion(uint3 id : SV_DispatchThreadID)

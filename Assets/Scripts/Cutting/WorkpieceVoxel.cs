@@ -38,6 +38,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     public WorkpieceBlankShape blankShape = WorkpieceBlankShape.Box;
     [Min(0f)] public float blankInnerRadius = 20f;
     public GameObject importedBlankMeshRoot;
+    public Vector3 importedBlankScalePercent = Vector3.one * 100f;
 
     [Header("Surface")]
     public WorkpieceSurfaceMode surfaceMode = WorkpieceSurfaceMode.SmoothSdf;
@@ -146,7 +147,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private int sdfRegionUploadBufferCapacity;
     private float[] sdfLinearSamples;
     private float[] sdfRegionSamples;
-    private int sdfInitKernel = -1;
     private int sdfCopyRegionKernel = -1;
     private bool sdfGpuReady;
     private bool sdfGpuUnavailable;
@@ -289,6 +289,28 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             }
 
             return sdfSamples != null || (UsesGpuSurfaceRendering && sdfGpuReady);
+        }
+    }
+
+    public bool IsNativeSdfReady
+    {
+        get
+        {
+            if (surfaceMode != WorkpieceSurfaceMode.SmoothSdf || !sdfNativeReady)
+            {
+                return false;
+            }
+
+            try
+            {
+                return SdfNativePlugin.sdf_is_ready() != 0;
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogWarning($"Native SDF readiness check failed: {ex.Message}", this);
+                sdfNativeReady = false;
+                return false;
+            }
         }
     }
 
@@ -778,6 +800,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
     public void ClearNativeBlankMesh()
     {
+        bool invalidatesImportedBlank = blankShape == WorkpieceBlankShape.ImportedMesh;
         nativeBlankMeshVertices = null;
         nativeBlankMeshTriangleIndices = null;
         nativeBlankMeshVertexCount = 0;
@@ -794,6 +817,13 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         try
         {
             SdfNativePlugin.sdf_clear_blank_mesh();
+            if (invalidatesImportedBlank)
+            {
+                sdfNativeReady = false;
+                nativeOpenVdbActiveVoxelCount = 0;
+                ClearGpuVisualCuts();
+                ClearNativeCutDetailDisplay(false);
+            }
         }
         catch (System.Exception ex)
         {
@@ -857,13 +887,14 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         MeshFilter[] filters = sourceRoot.GetComponentsInChildren<MeshFilter>(true);
         for (int i = 0; i < filters.Length; i++)
         {
-            AccumulateImportedBlankMesh(filters[i].transform, filters[i].sharedMesh, vertexList, indexList);
+            AccumulateImportedBlankMesh(sourceRoot.transform, filters[i].transform, filters[i].sharedMesh, vertexList, indexList);
         }
 
         SkinnedMeshRenderer[] skinnedRenderers = sourceRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
         for (int i = 0; i < skinnedRenderers.Length; i++)
         {
             AccumulateImportedBlankMesh(
+                sourceRoot.transform,
                 skinnedRenderers[i].transform,
                 skinnedRenderers[i].sharedMesh,
                 vertexList,
@@ -875,6 +906,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             return false;
         }
 
+        CenterAndScaleImportedBlankVertices(vertexList);
         vertexCount = vertexList.Count;
         indexCount = indexList.Count;
         vertices = new float[vertexCount * 3];
@@ -892,12 +924,13 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     }
 
     private void AccumulateImportedBlankMesh(
+        Transform rootTransform,
         Transform meshTransform,
         Mesh mesh,
         List<Vector3> vertices,
         List<int> triangleIndices)
     {
-        if (meshTransform == null || mesh == null || !mesh.isReadable)
+        if (rootTransform == null || meshTransform == null || mesh == null || !mesh.isReadable)
         {
             return;
         }
@@ -906,7 +939,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         int baseIndex = vertices.Count;
         for (int i = 0; i < meshVertices.Length; i++)
         {
-            vertices.Add(transform.InverseTransformPoint(meshTransform.TransformPoint(meshVertices[i])));
+            vertices.Add(rootTransform.InverseTransformPoint(meshTransform.TransformPoint(meshVertices[i])));
         }
 
         for (int subMesh = 0; subMesh < mesh.subMeshCount; subMesh++)
@@ -932,6 +965,32 @@ public sealed class WorkpieceVoxel : MonoBehaviour
                 triangleIndices.Add(baseIndex + b);
                 triangleIndices.Add(baseIndex + c);
             }
+        }
+    }
+
+    private void CenterAndScaleImportedBlankVertices(List<Vector3> vertices)
+    {
+        if (vertices == null || vertices.Count == 0)
+        {
+            return;
+        }
+
+        Vector3 min = vertices[0];
+        Vector3 max = vertices[0];
+        for (int i = 1; i < vertices.Count; i++)
+        {
+            min = Vector3.Min(min, vertices[i]);
+            max = Vector3.Max(max, vertices[i]);
+        }
+
+        Vector3 center = (min + max) * 0.5f;
+        Vector3 scale = new Vector3(
+            Mathf.Clamp(importedBlankScalePercent.x, 0.001f, 1000f),
+            Mathf.Clamp(importedBlankScalePercent.y, 0.001f, 1000f),
+            Mathf.Clamp(importedBlankScalePercent.z, 0.001f, 1000f)) * 0.01f;
+        for (int i = 0; i < vertices.Count; i++)
+        {
+            vertices[i] = Vector3.Scale(vertices[i] - center, scale);
         }
     }
 
@@ -1026,17 +1085,10 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         else
         {
             voxels = null;
-            if (UsesGpuSurfaceRendering)
-            {
-                sdfSamples = null;
-            }
-            else
-            {
-                InitializeSdfSamples();
-            }
+            InitializeSdfSamples();
         }
-        InitializeGpuSdfResources();
         InitializeNativeSdfPlugin();
+        InitializeGpuSdfResources();
 
         if (UsesGpuSurfaceRendering)
         {
@@ -1048,13 +1100,36 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         else if (UsesChunkedSmoothMesh)
         {
             EnsureChunks();
-            RebuildAllChunksImmediate();
             ClearParentMesh();
+            if (Application.isPlaying && asyncSmoothMeshRebuild)
+            {
+                QueueAllChunks();
+                RebuildQueuedChunksBudgetImmediate(chunkRebuildsPerFrame);
+                if (chunkRebuildCoroutine == null && dirtyChunkQueue.Count > 0)
+                {
+                    chunkRebuildCoroutine = StartCoroutine(RebuildDirtyChunksCoroutine());
+                }
+            }
+            else
+            {
+                RebuildAllChunksImmediate();
+            }
         }
         else
         {
             DestroyChunks();
-            RebuildMeshImmediate();
+            if (Application.isPlaying &&
+                asyncSmoothMeshRebuild &&
+                surfaceMode == WorkpieceSurfaceMode.SmoothSdf &&
+                SdfSampleCountLong > smoothRebuildCellsPerFrame * 8L)
+            {
+                ClearParentMesh();
+                rebuildCoroutine = StartCoroutine(RebuildSmoothMeshCoroutine());
+            }
+            else
+            {
+                RebuildMeshImmediate();
+            }
         }
     }
 
@@ -1410,11 +1485,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             BuildBlockyMesh();
         }
 
-        if (meshRenderer != null)
-        {
-            meshRenderer.enabled = true;
-        }
-
         ApplyMeshData();
     }
 
@@ -1448,6 +1518,10 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         runtimeMesh.RecalculateBounds();
 
         meshFilter.sharedMesh = runtimeMesh;
+        if (meshRenderer != null && !UsesGpuSurfaceRendering && !UsesChunkedSmoothMesh)
+        {
+            meshRenderer.enabled = true;
+        }
 
         if (updateCollider)
         {
@@ -1578,6 +1652,23 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         for (int i = 0; i < chunks.Length; i++)
         {
             BuildChunkMesh(chunks[i]);
+        }
+    }
+
+    private void QueueAllChunks()
+    {
+        EnsureChunks();
+        dirtyChunkQueue.Clear();
+
+        if (chunkQueued == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < chunkQueued.Length; i++)
+        {
+            chunkQueued[i] = true;
+            dirtyChunkQueue.Enqueue(i);
         }
     }
 
@@ -2000,17 +2091,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private void InitializeSdfSamples()
     {
         sdfSamples = new float[SampleWidth, SampleHeight, SampleDepth];
-
-        for (int x = 0; x < SampleWidth; x++)
-        {
-            for (int y = 0; y < SampleHeight; y++)
-            {
-                for (int z = 0; z < SampleDepth; z++)
-                {
-                    sdfSamples[x, y, z] = BoxSdf(GetSamplePointLocal(x, y, z));
-                }
-            }
-        }
     }
 
     private void InitializeGpuSdfResources()
@@ -2030,7 +2110,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             return false;
         }
 
-        if (!UsesGpuSurfaceRendering && sdfSamples == null)
+        if (sdfSamples == null)
         {
             return false;
         }
@@ -2057,20 +2137,12 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         try
         {
             sdfDisplayBufferCompute = shader;
-            sdfInitKernel = sdfDisplayBufferCompute.FindKernel("InitializeBoxSdf");
             sdfCopyRegionKernel = sdfDisplayBufferCompute.FindKernel("CopySdfRegion");
 
             sdfSampleBuffer = new ComputeBuffer(sampleCount, sizeof(float));
-            if (UsesGpuSurfaceRendering)
-            {
-                DispatchGpuSdfInitialization();
-            }
-            else
-            {
-                EnsureSdfLinearSamples();
-                CopySdfSamplesToLinear();
-                sdfSampleBuffer.SetData(sdfLinearSamples);
-            }
+            EnsureSdfLinearSamples();
+            CopySdfSamplesToLinear();
+            sdfSampleBuffer.SetData(sdfLinearSamples);
 
             sdfGpuReady = true;
             return true;
@@ -2111,22 +2183,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         sdfRegionUploadBufferCapacity = 0;
         sdfGpuReady = false;
-        sdfInitKernel = -1;
         sdfCopyRegionKernel = -1;
-    }
-
-    private void DispatchGpuSdfInitialization()
-    {
-        sdfDisplayBufferCompute.SetBuffer(sdfInitKernel, "_SdfSamples", sdfSampleBuffer);
-        sdfDisplayBufferCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
-        sdfDisplayBufferCompute.SetVector("_GridMin", GetLocalMin());
-        sdfDisplayBufferCompute.SetVector("_LocalSize", LocalSize);
-        sdfDisplayBufferCompute.SetFloat("_VoxelSize", voxelSize);
-
-        int threadGroupsX = Mathf.CeilToInt(SampleWidth / 8f);
-        int threadGroupsY = Mathf.CeilToInt(SampleHeight / 8f);
-        int threadGroupsZ = Mathf.CeilToInt(SampleDepth / 4f);
-        sdfDisplayBufferCompute.Dispatch(sdfInitKernel, threadGroupsX, threadGroupsY, threadGroupsZ);
     }
 
     private void UploadSdfSamplesToGpu()
@@ -3404,9 +3461,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         {
             Vector3 min = GetLocalMin();
             Vector3 size = LocalSize;
-            int nativeBlankShape = blankShape == WorkpieceBlankShape.ImportedMesh
-                ? (int)WorkpieceBlankShape.Box
-                : (int)blankShape;
+            int nativeBlankShape = ResolveNativeBlankShape(blankShape);
             SdfNativePlugin.sdf_plugin_init(
                 width, height, depth,
                 SampleWidth, SampleHeight, SampleDepth,
@@ -3431,7 +3486,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
                     return;
                 }
             }
-            else if (blankShape != WorkpieceBlankShape.Box)
+            else
             {
                 UploadSdfFromNative();
             }
@@ -3886,6 +3941,19 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         };
     }
 
+    private static int ResolveNativeBlankShape(WorkpieceBlankShape shape)
+    {
+        return shape switch
+        {
+            WorkpieceBlankShape.Box => 0,
+            WorkpieceBlankShape.Cylinder => 1,
+            WorkpieceBlankShape.Tube => 2,
+            WorkpieceBlankShape.HalfTube => 3,
+            WorkpieceBlankShape.ImportedMesh => 0,
+            _ => 0
+        };
+    }
+
     private void UploadSdfFromNative()
     {
         if (!sdfNativeReady)
@@ -4334,23 +4402,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             };
             runtimeMesh.MarkDynamic();
         }
-    }
-
-    private float BoxSdf(Vector3 localPoint)
-    {
-        Vector3 halfSize = LocalSize * 0.5f;
-        Vector3 q = new Vector3(
-            Mathf.Abs(localPoint.x),
-            Mathf.Abs(localPoint.y),
-            Mathf.Abs(localPoint.z)) - halfSize;
-
-        Vector3 outside = new Vector3(
-            Mathf.Max(q.x, 0f),
-            Mathf.Max(q.y, 0f),
-            Mathf.Max(q.z, 0f));
-
-        float inside = Mathf.Min(Mathf.Max(q.x, Mathf.Max(q.y, q.z)), 0f);
-        return outside.magnitude + inside;
     }
 
     private float SampleSdf(Vector3 localPoint)

@@ -3258,11 +3258,19 @@ SDF_EXPORT void sdf_clear_blank_mesh()
     std::lock_guard<std::mutex> lock(gMutex);
     gState.blankMesh.reset();
     if (gState.blankShape == BlankShapeImportedMesh) {
-        gState.blankShape = BlankShapeBox;
+        gState.initialized = false;
+        gState.sdf.clear();
         gState.cutHistory.clear();
         gState.removalApplied = false;
-        initializeStockSdf();
+        gState.connectivityReady = false;
+        gState.connectivityInProgress = false;
+        gState.islandsFound = false;
+        gState.pendingRemovalCount = 0;
+        gState.pendingRemovalIndices.clear();
         bumpMaterialRevisionUnlocked();
+#if defined(SDF_USE_OPENVDB)
+        gState.workpieceGrid.reset();
+#endif
     }
 }
 
