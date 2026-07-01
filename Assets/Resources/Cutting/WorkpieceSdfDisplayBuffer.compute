@@ -1,0 +1,57 @@
+#pragma kernel InitializeBoxSdf
+#pragma kernel CopySdfRegion
+
+// Display-side GPU buffer helper only.
+// Authoritative cutting/material state lives in the native C/C++ kernel.
+
+RWStructuredBuffer<float> _SdfSamples;
+StructuredBuffer<float> _SdfRegionSamples;
+
+int3 _SampleSize;
+int3 _RegionMin;
+int3 _RegionSize;
+float3 _GridMin;
+float3 _LocalSize;
+float _VoxelSize;
+
+[numthreads(8, 8, 4)]
+void InitializeBoxSdf(uint3 id : SV_DispatchThreadID)
+{
+    int3 sample = int3(id);
+    if (sample.x >= _SampleSize.x || sample.y >= _SampleSize.y || sample.z >= _SampleSize.z)
+    {
+        return;
+    }
+
+    float3 samplePoint = _GridMin + (float3(sample) - 1.0) * _VoxelSize;
+    float halfVoxel = _VoxelSize * 0.5;
+    float3 halfSize = max(_LocalSize * 0.5 - halfVoxel, float3(halfVoxel, halfVoxel, halfVoxel));
+    float3 q = abs(samplePoint) - halfSize;
+    float3 outside = max(q, 0.0);
+    float inside = min(max(q.x, max(q.y, q.z)), 0.0);
+    float sdf = length(outside) + inside;
+
+    int index = sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
+    _SdfSamples[index] = sdf;
+}
+
+[numthreads(8, 8, 4)]
+void CopySdfRegion(uint3 id : SV_DispatchThreadID)
+{
+    int3 local = int3(id);
+    if (local.x >= _RegionSize.x || local.y >= _RegionSize.y || local.z >= _RegionSize.z)
+    {
+        return;
+    }
+
+    int3 sample = _RegionMin + local;
+    if (sample.x < 0 || sample.y < 0 || sample.z < 0 ||
+        sample.x >= _SampleSize.x || sample.y >= _SampleSize.y || sample.z >= _SampleSize.z)
+    {
+        return;
+    }
+
+    int src = local.x + _RegionSize.x * (local.y + _RegionSize.y * local.z);
+    int dst = sample.x + _SampleSize.x * (sample.y + _SampleSize.y * sample.z);
+    _SdfSamples[dst] = _SdfRegionSamples[src];
+}

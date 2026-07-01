@@ -45,13 +45,8 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 float4 profile7;
             };
             StructuredBuffer<VisualCutOperation> _VisualCutOperations;
-            struct DetachedRemovalBox
-            {
-                float4 center;
-                float4 size;
-            };
-            StructuredBuffer<DetachedRemovalBox> _DetachedRemovalBoxes;
-            StructuredBuffer<float> _DetachedVoxelMask;
+            StructuredBuffer<float> _NativeCutDetailSamples;
+            StructuredBuffer<float4> _NativeCutDetailTiles;
             float4x4 _LocalToWorld;
             float4x4 _WorldToLocal;
             float4 _BaseColor;
@@ -61,21 +56,18 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
             float4 _LocalSize;
             float4 _DisplaySize;
             float4 _DisplayCenter;
-            float4 _DetachedVoxelMaskSize;
-            float4 _DetachedVoxelMaskMin;
-            float4 _DetachedVoxelMaskStep;
             float _VoxelSize;
             float _IsoLevel;
             float _MaxSteps;
             float _StepScale;
-            float _DetachedVoxelMaskAirValue;
             int _VisualCutOperationCount;
-            int _DetachedRemovalBoxCount;
+            int _NativeCutDetailEnabled;
+            int _NativeCutDetailTileCount;
             int _ProfileSegmentCount;
             int _AngularProfileAxialSampleCount;
             int _AngularProfileAngleSampleCount;
-            float _AngularProfileMinRadiusSamples[512];
-            float _AngularProfileMaxRadiusSamples[512];
+            StructuredBuffer<float> _AngularProfileMinRadiusSamples;
+            StructuredBuffer<float> _AngularProfileMaxRadiusSamples;
 
             struct Attributes
             {
@@ -204,8 +196,8 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
 
             float VisualAngularProfileSample(float normalizedHeight, float normalizedAngle, bool sampleMin)
             {
-                int axialCount = clamp(_AngularProfileAxialSampleCount, 0, 16);
-                int angleCount = clamp(_AngularProfileAngleSampleCount, 0, 32);
+                int axialCount = clamp(_AngularProfileAxialSampleCount, 0, 32);
+                int angleCount = clamp(_AngularProfileAngleSampleCount, 0, 64);
                 if (axialCount < 2 || angleCount < 3)
                 {
                     return -1.0;
@@ -216,8 +208,12 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 int axial1 = axial0 + 1;
                 float axialT = saturate(axialPosition - axial0);
                 float anglePosition = frac(normalizedAngle) * (float)angleCount;
-                int angle0 = (int)floor(anglePosition) % angleCount;
-                int angle1 = (angle0 + 1) % angleCount;
+                int angle0 = min((int)floor(anglePosition), angleCount - 1);
+                int angle1 = angle0 + 1;
+                if (angle1 >= angleCount)
+                {
+                    angle1 = 0;
+                }
                 float angleT = saturate(anglePosition - floor(anglePosition));
                 int index00 = axial0 * angleCount + angle0;
                 int index01 = axial0 * angleCount + angle1;
@@ -227,15 +223,15 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 float value01 = sampleMin ? _AngularProfileMinRadiusSamples[index01] : _AngularProfileMaxRadiusSamples[index01];
                 float value10 = sampleMin ? _AngularProfileMinRadiusSamples[index10] : _AngularProfileMaxRadiusSamples[index10];
                 float value11 = sampleMin ? _AngularProfileMinRadiusSamples[index11] : _AngularProfileMaxRadiusSamples[index11];
-                float angleA = lerp(value00, value01, smoothstep(0.0, 1.0, angleT));
-                float angleB = lerp(value10, value11, smoothstep(0.0, 1.0, angleT));
-                return lerp(angleA, angleB, smoothstep(0.0, 1.0, axialT));
+                float angleA = lerp(value00, value01, angleT);
+                float angleB = lerp(value10, value11, angleT);
+                return lerp(angleA, angleB, axialT);
             }
 
             float2 VisualAngularProfileInterval(float axial, float3 radial, float3 axis, float radius, float height, VisualCutOperation operation)
             {
-                int axialCount = clamp(_AngularProfileAxialSampleCount, 0, 16);
-                int angleCount = clamp(_AngularProfileAngleSampleCount, 0, 32);
+                int axialCount = clamp(_AngularProfileAxialSampleCount, 0, 32);
+                int angleCount = clamp(_AngularProfileAngleSampleCount, 0, 64);
                 if (axialCount < 2 || angleCount < 3)
                 {
                     return float2(-1.0, -1.0);
@@ -401,6 +397,24 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                         height,
                         operation);
                 }
+                else if (radialMotionLengthSqr <= radialMotionEpsilon * radialMotionEpsilon)
+                {
+                    return max(
+                        VisualProfileDifferenceAtRoot(
+                            samplePosition,
+                            start,
+                            axis,
+                            radius,
+                            height,
+                            operation),
+                        VisualProfileDifferenceAtRoot(
+                            samplePosition,
+                            end,
+                            axis,
+                            radius,
+                            height,
+                            operation));
+                }
                 else
                 {
                     t = saturate(dot(radialFromStart, radialMotion) / radialMotionLengthSqr);
@@ -426,7 +440,6 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
             float SampleVisualCuts(float3 localPoint)
             {
                 float cutDifference = -1000000.0;
-                [loop]
                 for (int operationIndex = 0; operationIndex < _VisualCutOperationCount; operationIndex++)
                 {
                     cutDifference = max(cutDifference, VisualCutDifference(localPoint, _VisualCutOperations[operationIndex]));
@@ -434,68 +447,101 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 return cutDifference;
             }
 
-            float SampleDetachedRemovals(float3 localPoint)
+            bool NativeCutDetailTileContains(float3 localPoint, int tileIndex)
             {
-                float removalDifference = -1000000.0;
-                [loop]
-                for (int boxIndex = 0; boxIndex < _DetachedRemovalBoxCount; boxIndex++)
+                float4 minStep = _NativeCutDetailTiles[tileIndex * 2];
+                float4 sizeOffset = _NativeCutDetailTiles[tileIndex * 2 + 1];
+                int3 detailSize = int3(sizeOffset.xyz);
+                if (any(detailSize < int3(2, 2, 2)))
                 {
-                    DetachedRemovalBox removal = _DetachedRemovalBoxes[boxIndex];
-                    removalDifference = max(
-                        removalDifference,
-                        -BoxSdf(localPoint, removal.center.xyz, removal.size.xyz));
+                    return false;
                 }
-                return removalDifference;
+
+                float step = max(minStep.w, 0.000001);
+                float3 grid = (localPoint - minStep.xyz) / step;
+                return !any(grid < 0.0) && !any(grid > float3(detailSize - 1));
             }
 
-            float SampleDetachedVoxelMask(float3 localPoint)
+            bool NativeCutDetailContains(float3 localPoint)
             {
-                int3 maskSize = int3(_DetachedVoxelMaskSize.xyz);
-                if (any(maskSize <= 0))
+                if (_NativeCutDetailEnabled == 0 || _NativeCutDetailTileCount <= 0)
+                {
+                    return false;
+                }
+
+                for (int tileIndex = 0; tileIndex < _NativeCutDetailTileCount; tileIndex++)
+                {
+                    if (NativeCutDetailTileContains(localPoint, tileIndex))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            int NativeCutDetailIndex(int3 sample, int3 detailSize)
+            {
+                return sample.x + detailSize.x * (sample.y + detailSize.y * sample.z);
+            }
+
+            float SampleNativeCutDetail(float3 localPoint)
+            {
+                if (_NativeCutDetailEnabled == 0 || _NativeCutDetailTileCount <= 0)
                 {
                     return -1000000.0;
                 }
 
-                float3 safeStep = max(
-                    _DetachedVoxelMaskStep.xyz,
-                    float3(0.000001, 0.000001, 0.000001));
-                float3 normalized = (localPoint - _DetachedVoxelMaskMin.xyz) / safeStep;
-                if (any(normalized < 0.0) || any(normalized >= float3(maskSize)))
+                float result = -1000000.0;
+                for (int tileIndex = 0; tileIndex < _NativeCutDetailTileCount; tileIndex++)
                 {
-                    return -1000000.0;
+                    if (!NativeCutDetailTileContains(localPoint, tileIndex))
+                    {
+                        continue;
+                    }
+
+                    float4 minStep = _NativeCutDetailTiles[tileIndex * 2];
+                    float4 sizeOffset = _NativeCutDetailTiles[tileIndex * 2 + 1];
+                    int3 detailSize = int3(sizeOffset.xyz);
+                    int sampleOffset = (int)sizeOffset.w;
+                    float step = max(minStep.w, 0.000001);
+                    float3 grid = (localPoint - minStep.xyz) / step;
+                    int3 i0 = clamp((int3)floor(grid), int3(0, 0, 0), detailSize - 1);
+                    int3 i1 = min(i0 + 1, detailSize - 1);
+                    float3 t = saturate(grid - float3(i0));
+
+                    float c000 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i0.x, i0.y, i0.z), detailSize)];
+                    float c100 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i1.x, i0.y, i0.z), detailSize)];
+                    float c010 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i0.x, i1.y, i0.z), detailSize)];
+                    float c110 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i1.x, i1.y, i0.z), detailSize)];
+                    float c001 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i0.x, i0.y, i1.z), detailSize)];
+                    float c101 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i1.x, i0.y, i1.z), detailSize)];
+                    float c011 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i0.x, i1.y, i1.z), detailSize)];
+                    float c111 = _NativeCutDetailSamples[sampleOffset + NativeCutDetailIndex(int3(i1.x, i1.y, i1.z), detailSize)];
+
+                    float c00 = lerp(c000, c100, t.x);
+                    float c10 = lerp(c010, c110, t.x);
+                    float c01 = lerp(c001, c101, t.x);
+                    float c11 = lerp(c011, c111, t.x);
+                    float c0 = lerp(c00, c10, t.y);
+                    float c1 = lerp(c01, c11, t.y);
+                    result = max(result, lerp(c0, c1, t.z));
                 }
 
-                float3 grid = normalized - 0.5;
-                int3 i0 = clamp((int3)floor(grid), int3(0, 0, 0), maskSize - 1);
-                int3 i1 = min(i0 + 1, maskSize - 1);
-                float3 t = saturate(grid - float3(i0));
-
-                int i000 = i0.x + maskSize.x * (i0.y + maskSize.y * i0.z);
-                int i100 = i1.x + maskSize.x * (i0.y + maskSize.y * i0.z);
-                int i010 = i0.x + maskSize.x * (i1.y + maskSize.y * i0.z);
-                int i110 = i1.x + maskSize.x * (i1.y + maskSize.y * i0.z);
-                int i001 = i0.x + maskSize.x * (i0.y + maskSize.y * i1.z);
-                int i101 = i1.x + maskSize.x * (i0.y + maskSize.y * i1.z);
-                int i011 = i0.x + maskSize.x * (i1.y + maskSize.y * i1.z);
-                int i111 = i1.x + maskSize.x * (i1.y + maskSize.y * i1.z);
-
-                float c00 = lerp(_DetachedVoxelMask[i000], _DetachedVoxelMask[i100], t.x);
-                float c10 = lerp(_DetachedVoxelMask[i010], _DetachedVoxelMask[i110], t.x);
-                float c01 = lerp(_DetachedVoxelMask[i001], _DetachedVoxelMask[i101], t.x);
-                float c11 = lerp(_DetachedVoxelMask[i011], _DetachedVoxelMask[i111], t.x);
-                float c0 = lerp(c00, c10, t.y);
-                float c1 = lerp(c01, c11, t.y);
-                return lerp(c0, c1, t.z);
+                return result;
             }
 
             float SampleSdf(float3 localPoint)
             {
                 float fullWorkpiece = BoxSdf(localPoint, _DisplayCenter.xyz, _DisplaySize.xyz);
-                float combinedWorkpiece = max(
-                    max(
-                        max(fullWorkpiece, SampleVisualCuts(localPoint)),
-                        SampleDetachedRemovals(localPoint)),
-                    SampleDetachedVoxelMask(localPoint));
+                bool nativeCutDetailContainsPoint = NativeCutDetailContains(localPoint);
+                float nativeCutDetail = nativeCutDetailContainsPoint
+                    ? SampleNativeCutDetail(localPoint)
+                    : -1000000.0;
+                float visualCuts = nativeCutDetailContainsPoint
+                    ? -1000000.0
+                    : SampleVisualCuts(localPoint);
+                float combinedWorkpiece = max(max(fullWorkpiece, visualCuts), nativeCutDetail);
                 float3 detailHalfSize = _LocalSize.xyz * 0.5;
                 float3 voxelVector = float3(_VoxelSize, _VoxelSize, _VoxelSize);
 
@@ -505,30 +551,12 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 }
 
                 float storedDetail = SampleDetailSdf(localPoint);
-                float3 initialHalfSize = max(detailHalfSize - voxelVector * 0.5, voxelVector * 0.5);
-                float3 q = abs(localPoint) - initialHalfSize;
-                float initialDetail = length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-                float cutValue = storedDetail > initialDetail + _VoxelSize * 0.0001
-                    ? storedDetail
-                    : -1000000.0;
-                return max(combinedWorkpiece, cutValue);
+                return max(combinedWorkpiece, storedDetail);
             }
 
             float3 GetSdfNormal(float3 localPoint)
             {
-                float e = _VoxelSize;
-                float detachedMaskValue = SampleDetachedVoxelMask(localPoint);
-                float detachedMaskStep = min(
-                    _DetachedVoxelMaskStep.x,
-                    min(_DetachedVoxelMaskStep.y, _DetachedVoxelMaskStep.z));
-                if (detachedMaskValue > -999999.0 &&
-                    abs(detachedMaskValue) <= detachedMaskStep * 2.0)
-                {
-                    // The global connectivity grid is intentionally coarser
-                    // than the local cutting grid. Sample its normal over a
-                    // matching footprint instead of magnifying cell corners.
-                    e = max(e, detachedMaskStep * 0.3);
-                }
+                float e = max(_VoxelSize * 0.5, 0.0005);
                 float dx = SampleSdf(localPoint + float3(e, 0.0, 0.0)) - SampleSdf(localPoint - float3(e, 0.0, 0.0));
                 float dy = SampleSdf(localPoint + float3(0.0, e, 0.0)) - SampleSdf(localPoint - float3(0.0, e, 0.0));
                 float dz = SampleSdf(localPoint + float3(0.0, 0.0, e)) - SampleSdf(localPoint - float3(0.0, 0.0, e));
@@ -572,44 +600,50 @@ Shader "Hidden/Cutting/GpuSdfWorkpiece"
                 float lastT = t;
                 float lastValue = SampleSdf(cameraLocal + rayDirection * t) - _IsoLevel;
                 float hitT = -1.0;
-                float minStep = max(_VoxelSize * _StepScale * 0.35, 0.0005);
-                float hitEpsilon = max(_VoxelSize * 0.08, 0.0005);
+                float minStep = max(_VoxelSize * _StepScale * 0.18, 0.00025);
+                float hitEpsilon = max(_VoxelSize * 0.02, 0.00025);
                 int maxSteps = max(16, (int)_MaxSteps);
 
-                [loop]
                 for (int i = 0; i < maxSteps && t <= tMax; i++)
                 {
                     float3 p = cameraLocal + rayDirection * t;
                     float value = SampleSdf(p) - _IsoLevel;
 
-                    if (value <= hitEpsilon)
+                    if (value <= 0.0)
                     {
-                        hitT = t;
+                        float low = lastT;
+                        float high = t;
 
-                        if (lastValue > 0.0 && value <= 0.0)
+                        if (lastValue <= 0.0)
                         {
-                            float low = lastT;
-                            float high = t;
-
-                            [unroll]
-                            for (int j = 0; j < 8; j++)
-                            {
-                                float mid = (low + high) * 0.5;
-                                float midValue = SampleSdf(cameraLocal + rayDirection * mid) - _IsoLevel;
-                                if (midValue > 0.0)
-                                {
-                                    low = mid;
-                                }
-                                else
-                                {
-                                    high = mid;
-                                }
-                            }
-
-                            hitT = high;
+                            low = max(max(tMin, 0.0), t - minStep);
                         }
 
+                        [unroll]
+                        for (int refineStep = 0; refineStep < 8; refineStep++)
+                        {
+                            float mid = (low + high) * 0.5;
+                            float midValue = SampleSdf(cameraLocal + rayDirection * mid) - _IsoLevel;
+                            if (midValue > 0.0)
+                            {
+                                low = mid;
+                            }
+                            else
+                            {
+                                high = mid;
+                            }
+                        }
+
+                        hitT = high;
                         break;
+                    }
+
+                    if (value <= hitEpsilon)
+                    {
+                        lastT = t;
+                        lastValue = value;
+                        t += max(value * max(_StepScale, 0.25), minStep * 0.5);
+                        continue;
                     }
 
                     lastT = t;

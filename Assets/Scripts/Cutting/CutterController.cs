@@ -9,7 +9,6 @@ public sealed class CutterController : MonoBehaviour
 {
     [Header("Cutting")]
     public WorkpieceVoxel workpiece;
-    public SparseCutHistory sparseHistory;
     [Min(0.001f)] public float cutterRadius = 3f;
     [Min(0.001f)] public float cutInterval = 0.015f;
     [Min(0.001f)] public float meshRebuildInterval = 0.016f;
@@ -20,10 +19,16 @@ public sealed class CutterController : MonoBehaviour
     public bool useProfileCutter = true;
     [Min(0.001f)] public float cutterHeightScale = 1f;
 
+    [Header("Diagnostics")]
+    public bool logCutDiagnostics;
+    [Min(0.05f)] public float cutDiagnosticsInterval = 0.5f;
+
     [Header("Movement")]
     [Min(0.001f)] public float moveSpeed = 50f;
     [Min(0.001f)] public float verticalSpeed = 20f;
     [Min(1f)] public float shiftMultiplier = 3f;
+    [Min(0.001f)] public float maxMoveStepPerFrame = 0.25f;
+    [Min(0.001f)] public float maxCutSweepLength = 0.25f;
 
     [Header("Auto Test Path")]
     public bool autoMove;
@@ -40,17 +45,13 @@ public sealed class CutterController : MonoBehaviour
     private bool hasLastCutPosition;
     private bool hasPrimedCutPosition;
     private bool meshRebuildPending;
+    private float nextCutDiagnosticTime;
 
     public void PrimeCutSweep(Vector3 worldStart)
     {
         lastCutPosition = worldStart;
         hasLastCutPosition = true;
         hasPrimedCutPosition = true;
-    }
-
-    public void PrimeCutSweepFromAutomaticEntry()
-    {
-        PrimeCutSweep(GetAutomaticEntryPosition());
     }
 
     public void ResetCutSweep()
@@ -65,75 +66,15 @@ public sealed class CutterController : MonoBehaviour
             workpiece = Object.FindFirstObjectByType<WorkpieceVoxel>();
         }
 
-        if (sparseHistory == null)
-        {
-            sparseHistory = Object.FindFirstObjectByType<SparseCutHistory>();
-        }
-
         startPosition = transform.position;
         autoMoveOrigin = startPosition;
         autoMovePhase = autoMoveStraightLine ? 1f : 0f;
         if (!hasPrimedCutPosition)
         {
-            lastCutPosition = GetAutomaticEntryPosition();
-            hasLastCutPosition = true;
-            hasPrimedCutPosition = lastCutPosition != transform.position;
+            ResetCutSweep();
         }
         nextCutTime = Time.time;
         nextMeshRebuildTime = Time.time;
-    }
-
-    private Vector3 GetAutomaticEntryPosition()
-    {
-        if (workpiece == null)
-        {
-            return transform.position;
-        }
-
-        Bounds bounds = workpiece.LocalBounds;
-        Vector3 localPosition = workpiece.transform.InverseTransformPoint(transform.position);
-        if (!bounds.Contains(localPosition))
-        {
-            return transform.position;
-        }
-
-        Vector3 localAxis = workpiece.transform.InverseTransformDirection(transform.up).normalized;
-        Vector3 min = bounds.min;
-        Vector3 max = bounds.max;
-        float exitDistance = float.PositiveInfinity;
-        AccumulateExitDistance(localPosition.x, localAxis.x, min.x, max.x, ref exitDistance);
-        AccumulateExitDistance(localPosition.y, localAxis.y, min.y, max.y, ref exitDistance);
-        AccumulateExitDistance(localPosition.z, localAxis.z, min.z, max.z, ref exitDistance);
-
-        if (float.IsInfinity(exitDistance) || exitDistance < 0f)
-        {
-            return transform.position;
-        }
-
-        Vector3 localEntry = localPosition + localAxis * (exitDistance + workpiece.voxelSize);
-        return workpiece.transform.TransformPoint(localEntry);
-    }
-
-    private static void AccumulateExitDistance(
-        float position,
-        float direction,
-        float min,
-        float max,
-        ref float exitDistance)
-    {
-        const float axisEpsilon = 0.000001f;
-        if (Mathf.Abs(direction) <= axisEpsilon)
-        {
-            return;
-        }
-
-        float distance = direction > 0f
-            ? (max - position) / direction
-            : (min - position) / direction;
-        if (distance >= 0f)
-        {
-            exitDistance = Mathf.Min(exitDistance, distance);
-        }
     }
 
     private void Update()
@@ -235,13 +176,20 @@ public sealed class CutterController : MonoBehaviour
             ? shiftMultiplier
             : 1f;
 
-        Vector3 delta = horizontal * moveSpeed + vertical * verticalSpeed;
-        transform.position += delta * speedMultiplier * Time.deltaTime;
+        float deltaTime = Mathf.Min(Time.deltaTime, 1f / 30f);
+        Vector3 delta = (horizontal * moveSpeed + vertical * verticalSpeed) * speedMultiplier * deltaTime;
+        float maxStep = ResolveMaxMoveStep();
+        if (delta.sqrMagnitude > maxStep * maxStep)
+        {
+            delta = delta.normalized * maxStep;
+        }
+
+        transform.position += delta;
     }
 
     private void UpdateAutoMove()
     {
-        autoMovePhase += Time.deltaTime * autoMoveSpeed;
+        autoMovePhase += Mathf.Min(Time.deltaTime, 1f / 30f) * autoMoveSpeed;
 
         Vector3 offset;
         if (autoMoveStraightLine)
@@ -265,10 +213,12 @@ public sealed class CutterController : MonoBehaviour
     {
         if (workpiece == null)
         {
+            LogCutDiagnostic("Manual cut skipped because no workpiece is assigned.");
             return;
         }
 
-        bool changed = CutWorkpiece(transform.position, transform.position);
+        int changedSampleCount;
+        bool changed = CutWorkpiece(transform.position, transform.position, out changedSampleCount);
         lastCutPosition = transform.position;
         hasLastCutPosition = true;
 
@@ -281,6 +231,16 @@ public sealed class CutterController : MonoBehaviour
                 meshRebuildPending = false;
                 nextMeshRebuildTime = Time.time + meshRebuildInterval;
             }
+
+            LogCutDiagnostic(
+                $"Manual cut changed {changedSampleCount:n0} samples at {FormatVector(transform.position)}.");
+        }
+        else
+        {
+            LogCutDiagnostic(
+                $"Manual cut made no material change. position={FormatVector(transform.position)}, " +
+                $"useProfile={useProfileCutter}, radius={cutterRadius:0.###}mm, " +
+                $"height={(cutterRadius * cutterHeightScale):0.###}mm, workpieceReady={workpiece.IsInitialized}.");
         }
     }
 
@@ -288,13 +248,14 @@ public sealed class CutterController : MonoBehaviour
     {
         if (workpiece == null)
         {
+            LogCutDiagnostic("Continuous cut skipped because no workpiece is assigned.");
             return;
         }
 
         Vector3 currentPosition = transform.position;
         if (!hasLastCutPosition)
         {
-            lastCutPosition = GetAutomaticEntryPosition();
+            lastCutPosition = currentPosition;
             hasLastCutPosition = true;
         }
 
@@ -306,9 +267,11 @@ public sealed class CutterController : MonoBehaviour
             return;
         }
 
+        Vector3 previousPosition = lastCutPosition;
+        int changedSampleCount;
         bool changed = sweepBetweenCutPositions
-            ? CutWorkpiece(lastCutPosition, currentPosition)
-            : CutWorkpiece(currentPosition, currentPosition);
+            ? CutWorkpieceSegmented(previousPosition, currentPosition, out changedSampleCount)
+            : CutWorkpiece(currentPosition, currentPosition, out changedSampleCount);
 
         lastCutPosition = currentPosition;
 
@@ -323,7 +286,19 @@ public sealed class CutterController : MonoBehaviour
             else
             {
                 meshRebuildPending = true;
+                nextMeshRebuildTime = Time.time + meshRebuildInterval;
             }
+
+            LogCutDiagnostic(
+                $"Continuous cut changed {changedSampleCount:n0} samples. " +
+                $"start={FormatVector(previousPosition)}, end={FormatVector(currentPosition)}.");
+        }
+        else
+        {
+            LogCutDiagnostic(
+                $"Continuous cut made no material change. start={FormatVector(previousPosition)}, " +
+                $"end={FormatVector(currentPosition)}, distance={Vector3.Distance(previousPosition, currentPosition):0.###}mm, " +
+                $"useProfile={useProfileCutter}, radius={cutterRadius:0.###}mm.");
         }
     }
 
@@ -357,33 +332,99 @@ public sealed class CutterController : MonoBehaviour
 
     private bool CutWorkpiece(Vector3 worldStart, Vector3 worldEnd)
     {
-        if (useProfileCutter)
-        {
-            float cutterHeight = cutterRadius * cutterHeightScale;
-            if (sparseHistory != null && sparseHistory.enabled)
-            {
-                sparseHistory.RecordProfileCutterSweep(
-                    worldStart,
-                    worldEnd,
-                    transform.up,
-                    transform.right,
-                    cutterRadius,
-                    cutterHeight);
-            }
+        int changedSampleCount;
+        return CutWorkpiece(worldStart, worldEnd, out changedSampleCount);
+    }
 
-            return workpiece.CutSweptProfileCutter(
-                worldStart,
-                worldEnd,
-                transform.up,
-                transform.right,
-                cutterRadius,
-                cutterHeight,
-                false);
+    private bool CutWorkpiece(Vector3 worldStart, Vector3 worldEnd, out int changedSampleCount)
+    {
+        changedSampleCount = 0;
+        if (!useProfileCutter)
+        {
+            return worldStart == worldEnd
+                ? workpiece.CutSweptSphere(worldEnd, worldEnd, cutterRadius, false, out changedSampleCount)
+                : workpiece.CutSweptSphere(worldStart, worldEnd, cutterRadius, false, out changedSampleCount);
         }
 
-        return worldStart == worldEnd
-            ? workpiece.CutSphere(worldEnd, cutterRadius, false)
-            : workpiece.CutSweptSphere(worldStart, worldEnd, cutterRadius, false);
+        float cutterHeight = cutterRadius * cutterHeightScale;
+        return workpiece.CutSweptProfileCutter(
+            worldStart,
+            worldEnd,
+            transform.up,
+            transform.right,
+            cutterRadius,
+            cutterHeight,
+            false,
+            out changedSampleCount);
+    }
+
+    private bool CutWorkpieceSegmented(Vector3 worldStart, Vector3 worldEnd)
+    {
+        int changedSampleCount;
+        return CutWorkpieceSegmented(worldStart, worldEnd, out changedSampleCount);
+    }
+
+    private bool CutWorkpieceSegmented(Vector3 worldStart, Vector3 worldEnd, out int changedSampleCount)
+    {
+        changedSampleCount = 0;
+        float distance = Vector3.Distance(worldStart, worldEnd);
+        float maxSegmentLength = ResolveMaxCutSweepLength();
+        if (distance <= maxSegmentLength)
+        {
+            return CutWorkpiece(worldStart, worldEnd, out changedSampleCount);
+        }
+
+        int segmentCount = Mathf.Clamp(Mathf.CeilToInt(distance / maxSegmentLength), 1, 64);
+        bool changed = false;
+        Vector3 segmentStart = worldStart;
+        for (int i = 1; i <= segmentCount; i++)
+        {
+            Vector3 segmentEnd = Vector3.Lerp(worldStart, worldEnd, i / (float)segmentCount);
+            int segmentChangedSampleCount;
+            changed |= CutWorkpiece(segmentStart, segmentEnd, out segmentChangedSampleCount);
+            changedSampleCount += segmentChangedSampleCount;
+            segmentStart = segmentEnd;
+        }
+
+        return changed;
+    }
+
+    private float ResolveMaxMoveStep()
+    {
+        float configured = Mathf.Max(0.001f, maxMoveStepPerFrame);
+        if (workpiece == null)
+        {
+            return configured;
+        }
+
+        return Mathf.Max(workpiece.voxelSize * 4f, configured);
+    }
+
+    private float ResolveMaxCutSweepLength()
+    {
+        float configured = Mathf.Max(0.001f, maxCutSweepLength);
+        if (workpiece == null)
+        {
+            return configured;
+        }
+
+        return Mathf.Max(workpiece.voxelSize * 8f, configured);
+    }
+
+    private void LogCutDiagnostic(string message)
+    {
+        if (!logCutDiagnostics || !Application.isPlaying || Time.time < nextCutDiagnosticTime)
+        {
+            return;
+        }
+
+        nextCutDiagnosticTime = Time.time + Mathf.Max(0.05f, cutDiagnosticsInterval);
+        Debug.Log($"Cutter diagnostic: {message}", this);
+    }
+
+    private static string FormatVector(Vector3 value)
+    {
+        return $"({value.x:0.###}, {value.y:0.###}, {value.z:0.###})";
     }
 }
 
@@ -450,6 +491,38 @@ internal static class CuttingInput
         return Input.GetMouseButton(2);
 #else
         return false;
+#endif
+    }
+
+    public static bool WasLeftMousePressed()
+    {
+#if ENABLE_INPUT_SYSTEM
+        if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+        {
+            return true;
+        }
+#endif
+
+#if ENABLE_LEGACY_INPUT_MANAGER
+        return Input.GetMouseButtonDown(0);
+#else
+        return false;
+#endif
+    }
+
+    public static Vector2 MousePosition()
+    {
+#if ENABLE_INPUT_SYSTEM
+        if (Mouse.current != null)
+        {
+            return Mouse.current.position.ReadValue();
+        }
+#endif
+
+#if ENABLE_LEGACY_INPUT_MANAGER
+        return Input.mousePosition;
+#else
+        return Vector2.zero;
 #endif
     }
 

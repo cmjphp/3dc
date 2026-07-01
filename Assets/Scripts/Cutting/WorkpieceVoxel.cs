@@ -2,6 +2,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Serialization;
 
 public enum WorkpieceSurfaceMode
 {
@@ -9,13 +10,22 @@ public enum WorkpieceSurfaceMode
     SmoothSdf
 }
 
+public enum WorkpieceBlankShape
+{
+    Box,
+    Cylinder,
+    Tube,
+    HalfTube,
+    ImportedMesh
+}
+
 [RequireComponent(typeof(MeshFilter))]
 [RequireComponent(typeof(MeshRenderer))]
 public sealed class WorkpieceVoxel : MonoBehaviour
 {
     public const int MaxCutterProfileRadiusSamples = 32;
-    public const int MaxCutterAngularProfileAxialSamples = 16;
-    public const int MaxCutterAngularProfileAngleSamples = 32;
+    public const int MaxCutterAngularProfileAxialSamples = 32;
+    public const int MaxCutterAngularProfileAngleSamples = 64;
     public const int MaxCutterAngularProfileSamples =
         MaxCutterAngularProfileAxialSamples * MaxCutterAngularProfileAngleSamples;
 
@@ -24,7 +34,10 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     [Min(1)] public int height = 50;
     [Min(1)] public int depth = 77;
     [Min(0.001f)] public float voxelSize = 0.025f;
-    [Min(100000)] public int maxAllocatedSdfSamples = 12000000;
+    [Min(100000)] public int maxAllocatedSdfSamples = 64000000;
+    public WorkpieceBlankShape blankShape = WorkpieceBlankShape.Box;
+    [Min(0f)] public float blankInnerRadius = 20f;
+    public GameObject importedBlankMeshRoot;
 
     [Header("Surface")]
     public WorkpieceSurfaceMode surfaceMode = WorkpieceSurfaceMode.SmoothSdf;
@@ -39,19 +52,18 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     public bool rebuildCoreChunksImmediately = true;
     [Min(1)] public int immediateChunkRebuildLimit = 12;
 
-    [Header("Detached Material")]
+    [Header("Native Detached Material Cleanup")]
     public bool removeDetachedParts = true;
+    public bool automaticDetachedCleanup = true;
     [Min(0.01f)] public float detachedCleanupInterval = 0.08f;
-    public bool useGpuDetachedCleanup;
-    [Min(0.25f)] public float gpuDetachedAirValueVoxels = 1.5f;
-    [Min(10000)] public int maxGlobalConnectivityCells = 3000000;
-    [Min(1)] public int maxGpuDetachedRemovalBoxes = 256;
-    [Range(0.1f, 1f)] public float globalConnectivityFeatureScale = 0.25f;
 
-    [Header("GPU SDF Cutting")]
-    public bool useGpuSdfCutting;
-    public ComputeShader sdfCutCompute;
+    [Header("GPU SDF Display Buffer")]
+    [FormerlySerializedAs("useGpuSdfCutting")]
+    public bool useGpuSdfDisplayBuffer;
+    [FormerlySerializedAs("sdfCutCompute")]
+    public ComputeShader sdfDisplayBufferCompute;
     [Min(2)] public int profileSegmentCount = 6;
+    public bool preferNativeMeshCutter;
 
     [Header("GPU Surface Rendering")]
     public bool useGpuSurfaceRendering = true;
@@ -63,14 +75,31 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     [Min(10000)] public int maxGpuTriangles = 1000000;
     [Min(16)] public int gpuRaymarchMaxSteps = 192;
     [Range(0.25f, 2f)] public float gpuRaymarchStepScale = 0.75f;
+    public bool useGpuVisualCutPreview;
     [Min(16)] public int maxGpuVisualCutOperations = 512;
     public Color gpuSurfaceColor = new Color(0.72f, 0.76f, 0.78f, 1f);
+
+    [Header("Native Cut Detail Display")]
+    public bool useNativeCutDetailDisplay;
+    [Min(0.001f)] public float nativeCutDetailVoxelSize = 0.05f;
+    [Min(4096)] public int maxNativeCutDetailSamples = 350000;
+    [Min(1)] public int maxNativeCutDetailTiles = 6;
+    [Min(4096)] public int maxNativeCutDetailCachedSamples = 1200000;
+    [Min(0.01f)] public float nativeCutDetailUpdateInterval = 0.06f;
+    [Min(0f)] public float nativeCutDetailPaddingMm = 0.35f;
+    [Min(1024)] public int nativeCutDetailBatchSize = 32768;
 
     [Header("Runtime")]
     public bool initializeOnStart = true;
     public bool updateCollider;
 
+    [Header("Diagnostics")]
+    public bool logNativeCutDiagnostics;
+
     private const float IsoLevel = 0f;
+    private const float NativeCutDetailAirValue = -1000000f;
+    private const float MaxImportedBlankAxisMm = 1000f;
+    private const float NativeConnectivityIdleDelaySeconds = 0.25f;
     private float SdfChangeEpsilon
     {
         get { return voxelSize * 0.0001f; }
@@ -113,13 +142,12 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private int immediateChunkMarkVersion;
     private readonly Queue<int> dirtyChunkQueue = new Queue<int>(128);
     private ComputeBuffer sdfSampleBuffer;
-    private ComputeBuffer sdfChangedCounterBuffer;
+    private ComputeBuffer sdfRegionUploadBuffer;
+    private int sdfRegionUploadBufferCapacity;
     private float[] sdfLinearSamples;
-    private readonly int[] sdfChangedCounterData = new int[1];
-    private int sdfCutKernel = -1;
-    private int sdfProfileCutterKernel = -1;
+    private float[] sdfRegionSamples;
     private int sdfInitKernel = -1;
-    private int sdfRemoveUnsupportedColumnsKernel = -1;
+    private int sdfCopyRegionKernel = -1;
     private bool sdfGpuReady;
     private bool sdfGpuUnavailable;
     private bool gpuSurfaceUnavailable;
@@ -131,15 +159,21 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private ComputeBuffer gpuVisualCutBuffer;
     private int gpuVisualCutBufferCapacity;
     private bool gpuVisualCutsDirty;
-    private ComputeBuffer gpuDetachedRemovalBuffer;
-    private int gpuDetachedRemovalBufferCapacity;
-    private bool gpuDetachedRemovalsDirty;
-    private ComputeBuffer gpuDetachedVoxelMaskBuffer;
-    private int gpuDetachedVoxelMaskCapacity;
-    private Vector3Int gpuDetachedVoxelMaskSize;
-    private Vector3 gpuDetachedVoxelMaskMin;
-    private Vector3 gpuDetachedVoxelMaskStep = Vector3.one;
-    private float gpuDetachedVoxelMaskAirValue;
+    private ComputeBuffer nativeCutDetailBuffer;
+    private int nativeCutDetailBufferCapacity;
+    private ComputeBuffer nativeCutDetailTileBuffer;
+    private int nativeCutDetailTileBufferCapacity;
+    private float[] nativeCutDetailValues;
+    private float[] nativeCutDetailPackedValues;
+    private float[] nativeCutDetailBatchPoints;
+    private float[] nativeCutDetailBatchValues;
+    private Vector4[] nativeCutDetailTileData;
+    private bool nativeCutDetailReady;
+    private Coroutine nativeCutDetailCoroutine;
+    private int nativeCutDetailRequestVersion;
+    private float nextNativeCutDetailUpdateTime;
+    private ComputeBuffer cutterAngularProfileMinBuffer;
+    private ComputeBuffer cutterAngularProfileMaxBuffer;
     private int chunkCountX;
     private int chunkCountY;
     private int chunkCountZ;
@@ -147,13 +181,40 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private int cachedCellWidth;
     private int cachedCellHeight;
     private int cachedCellDepth;
-    private float nextDetachedCleanupTime;
     private bool sdfNativeReady;
     private float nextNativeConnectivityCheckTime;
     private bool nativeConnectivityDirty;
     private bool nativeConnectivityInFlight;
-    private bool globalVisualConnectivityDirty;
-    private float lastGlobalVisualCutTime;
+    private bool nativeConnectivityStalled;
+    private float nativeConnectivityCheckStartTime;
+    private float nextNativeConnectivityStallLogTime;
+    private float lastNativeConnectivityDirtyTime;
+    private int nativeConnectivityCheckSerial;
+    private bool nativeConnectivityHasRegion;
+    private int nativeConnectivityMinX;
+    private int nativeConnectivityMaxX;
+    private int nativeConnectivityMinY;
+    private int nativeConnectivityMaxY;
+    private int nativeConnectivityMinZ;
+    private int nativeConnectivityMaxZ;
+    private float[] nativeCutterMeshVertices;
+    private int[] nativeCutterMeshTriangleIndices;
+    private int nativeCutterMeshVertexCount;
+    private int nativeCutterMeshIndexCount;
+    private Vector3 nativeCutterMeshLocalMin;
+    private Vector3 nativeCutterMeshLocalMax;
+    private float[] nativeBlankMeshVertices;
+    private int[] nativeBlankMeshTriangleIndices;
+    private int nativeBlankMeshVertexCount;
+    private int nativeBlankMeshIndexCount;
+    private Vector3 nativeBlankMeshLocalMin;
+    private Vector3 nativeBlankMeshLocalMax;
+    [SerializeField] private int nativeBlankMeshTriangleCount;
+    [SerializeField] private int nativeCutterActiveVoxelCount;
+    [SerializeField] private int nativeOpenVdbActiveVoxelCount;
+    private float nextNativeNoChangeLogTime;
+    private float nextNativePositiveCutLogTime;
+    private float nextNativeNoOverlapLogTime;
 
     private readonly List<Vector3> vertices = new List<Vector3>(65536);
     private readonly List<int> triangles = new List<int>(65536);
@@ -162,15 +223,13 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private readonly Vector3[] tetraPositions = new Vector3[4];
     private readonly float[] tetraValues = new float[4];
     private readonly bool[] tetraInside = new bool[4];
-    private bool[] connectivitySolid;
-    private int[] connectivityLabels;
-    private readonly Queue<int> connectivityQueue = new Queue<int>(65536);
-    private readonly List<int> componentSizes = new List<int>(128);
     private readonly List<GpuVisualCutOperation> gpuVisualCutOperations = new List<GpuVisualCutOperation>(64);
-    private readonly List<GpuDetachedRemovalBox> gpuDetachedRemovalBoxes = new List<GpuDetachedRemovalBox>(16);
+    private readonly List<NativeCutDetailTile> nativeCutDetailTiles = new List<NativeCutDetailTile>(8);
     private readonly float[] cutterProfileRadiusSamples = new float[MaxCutterProfileRadiusSamples];
     private readonly float[] cutterAngularProfileMinRadiusSamples = new float[MaxCutterAngularProfileSamples];
     private readonly float[] cutterAngularProfileMaxRadiusSamples = new float[MaxCutterAngularProfileSamples];
+    private readonly float[] nativeCutDetailDummy = { NativeCutDetailAirValue };
+    private readonly Vector4[] nativeCutDetailTileDummy = { Vector4.zero, Vector4.zero };
     private int cutterProfileRadiusSampleCount;
     private int cutterAngularProfileAxialSampleCount;
     private int cutterAngularProfileAngleSampleCount;
@@ -192,24 +251,13 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         public Vector4 profile7;
     }
 
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
-    private struct GpuDetachedRemovalBox
+    private sealed class NativeCutDetailTile
     {
-        public Vector4 center;
-        public Vector4 size;
-    }
-
-    private struct GlobalConnectivityComponent
-    {
-        public int label;
-        public int count;
-        public int minX;
-        public int minY;
-        public int minZ;
-        public int maxX;
-        public int maxY;
-        public int maxZ;
-        public bool touchesSupportedBoundary;
+        public Vector3 min;
+        public float step;
+        public Vector3Int size;
+        public float[] values;
+        public int sampleCount;
     }
 
     private sealed class VoxelChunk
@@ -233,7 +281,15 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
     public bool IsInitialized
     {
-        get { return voxels != null && (sdfSamples != null || (UsesGpuSurfaceRendering && sdfGpuReady)); }
+        get
+        {
+            if (surfaceMode == WorkpieceSurfaceMode.BlockyVoxels)
+            {
+                return voxels != null;
+            }
+
+            return sdfSamples != null || (UsesGpuSurfaceRendering && sdfGpuReady);
+        }
     }
 
     public Vector3 LocalSize
@@ -319,7 +375,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
     private bool UsesGpuSdfBuffer
     {
-        get { return useGpuSdfCutting || UsesGpuSurfaceRendering; }
+        get { return useGpuSdfDisplayBuffer || UsesGpuSurfaceRendering; }
     }
 
     private bool HasAngularCutterProfile
@@ -328,6 +384,37 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         {
             return cutterAngularProfileAxialSampleCount >= 2 &&
                    cutterAngularProfileAngleSampleCount >= 3;
+        }
+    }
+
+    private bool HasNativeMeshCutter
+    {
+        get { return sdfNativeReady && nativeCutterActiveVoxelCount > 0; }
+    }
+
+    public bool TrySampleNativeSdfWorld(Vector3 worldPoint, out float value)
+    {
+        return TrySampleNativeSdfLocal(transform.InverseTransformPoint(worldPoint), out value);
+    }
+
+    public bool TrySampleNativeSdfLocal(Vector3 localPoint, out float value)
+    {
+        value = 0f;
+        if (!sdfNativeReady)
+        {
+            return false;
+        }
+
+        try
+        {
+            value = SdfNativePlugin.sdf_sample_point(localPoint.x, localPoint.y, localPoint.z);
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native SDF sample failed: {ex.Message}", this);
+            sdfNativeReady = false;
+            return false;
         }
     }
 
@@ -347,7 +434,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private void LateUpdate()
     {
         PollNativeConnectivity();
-        TryCleanupGlobalVisualIslandsIfDue();
         DrawGpuSurface();
     }
 
@@ -362,6 +448,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         DestroyChunks();
         ReleaseGpuSdfResources();
         ReleaseGpuSurfaceResources();
+        ReleaseCutterAngularProfileBuffers();
     }
 
     private void OnValidate()
@@ -371,18 +458,23 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         depth = Mathf.Max(1, depth);
         voxelSize = Mathf.Max(0.001f, voxelSize);
         maxAllocatedSdfSamples = Mathf.Max(100000, maxAllocatedSdfSamples);
+        blankInnerRadius = Mathf.Max(0f, blankInnerRadius);
         smoothRebuildCellsPerFrame = Mathf.Max(100, smoothRebuildCellsPerFrame);
         chunkSize = Mathf.Max(2, chunkSize);
         chunkRebuildsPerFrame = Mathf.Max(1, chunkRebuildsPerFrame);
         immediateChunkRebuildLimit = Mathf.Max(1, immediateChunkRebuildLimit);
         detachedCleanupInterval = Mathf.Max(0.01f, detachedCleanupInterval);
-        maxGlobalConnectivityCells = Mathf.Max(10000, maxGlobalConnectivityCells);
-        maxGpuDetachedRemovalBoxes = Mathf.Max(1, maxGpuDetachedRemovalBoxes);
-        globalConnectivityFeatureScale = Mathf.Clamp(globalConnectivityFeatureScale, 0.1f, 1f);
         maxGpuTriangles = Mathf.Max(10000, maxGpuTriangles);
         gpuRaymarchMaxSteps = Mathf.Max(16, gpuRaymarchMaxSteps);
         gpuRaymarchStepScale = Mathf.Clamp(gpuRaymarchStepScale, 0.25f, 2f);
         maxGpuVisualCutOperations = Mathf.Max(16, maxGpuVisualCutOperations);
+        nativeCutDetailVoxelSize = Mathf.Max(0.001f, nativeCutDetailVoxelSize);
+        maxNativeCutDetailSamples = Mathf.Max(4096, maxNativeCutDetailSamples);
+        maxNativeCutDetailTiles = Mathf.Max(1, maxNativeCutDetailTiles);
+        maxNativeCutDetailCachedSamples = Mathf.Max(maxNativeCutDetailSamples, maxNativeCutDetailCachedSamples);
+        nativeCutDetailUpdateInterval = Mathf.Max(0.01f, nativeCutDetailUpdateInterval);
+        nativeCutDetailPaddingMm = Mathf.Max(0f, nativeCutDetailPaddingMm);
+        nativeCutDetailBatchSize = Mathf.Max(1024, nativeCutDetailBatchSize);
         profileSegmentCount = Mathf.Max(2, profileSegmentCount);
         expandedDisplaySize = new Vector3(
             Mathf.Max(0.001f, expandedDisplaySize.x),
@@ -411,9 +503,11 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
     public void SetProfileRadiusSamples(float[] normalizedRadiusSamples, int sampleCount)
     {
+        ClearGpuVisualCuts();
         cutterProfileRadiusSampleCount = 0;
         if (normalizedRadiusSamples == null || sampleCount < 2)
         {
+            UploadNativeProfileRadiusSamples();
             return;
         }
 
@@ -439,10 +533,32 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         if (maxSample <= 0.000001f)
         {
+            UploadNativeProfileRadiusSamples();
             return;
         }
 
         cutterProfileRadiusSampleCount = count;
+        UploadNativeProfileRadiusSamples();
+    }
+
+    private void UploadNativeProfileRadiusSamples()
+    {
+        if (!sdfNativeReady)
+        {
+            return;
+        }
+
+        try
+        {
+            SdfNativePlugin.sdf_set_profile_radius_samples(
+                cutterProfileRadiusSamples,
+                cutterProfileRadiusSampleCount);
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native SDF profile radius update failed: {ex.Message}", this);
+            sdfNativeReady = false;
+        }
     }
 
     public void SetAngularProfileRadiusSamples(
@@ -451,8 +567,10 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         int axialSampleCount,
         int angleSampleCount)
     {
+        ClearGpuVisualCuts();
         cutterAngularProfileAxialSampleCount = 0;
         cutterAngularProfileAngleSampleCount = 0;
+        ReleaseCutterAngularProfileBuffers();
         for (int i = 0; i < MaxCutterAngularProfileSamples; i++)
         {
             cutterAngularProfileMinRadiusSamples[i] = 0f;
@@ -509,6 +627,359 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         cutterAngularProfileAxialSampleCount = axialCount;
         cutterAngularProfileAngleSampleCount = angleCount;
+        UploadCutterAngularProfileBuffers();
+    }
+
+    public void SetNativeCutterMesh(
+        float[] vertices,
+        int vertexCount,
+        int[] triangleIndices,
+        int indexCount)
+    {
+        if (vertices == null ||
+            triangleIndices == null ||
+            vertexCount <= 0 ||
+            indexCount < 3 ||
+            vertices.Length < vertexCount * 3 ||
+            triangleIndices.Length < indexCount)
+        {
+            ClearNativeCutterMesh();
+            return;
+        }
+
+        nativeCutterMeshVertexCount = vertexCount;
+        nativeCutterMeshIndexCount = indexCount;
+        nativeCutterMeshVertices = new float[vertexCount * 3];
+        nativeCutterMeshTriangleIndices = new int[indexCount];
+        System.Array.Copy(vertices, nativeCutterMeshVertices, nativeCutterMeshVertices.Length);
+        System.Array.Copy(triangleIndices, nativeCutterMeshTriangleIndices, nativeCutterMeshTriangleIndices.Length);
+
+        nativeCutterMeshLocalMin = new Vector3(vertices[0], vertices[1], vertices[2]);
+        nativeCutterMeshLocalMax = nativeCutterMeshLocalMin;
+        for (int i = 1; i < vertexCount; i++)
+        {
+            Vector3 vertex = new Vector3(
+                vertices[i * 3 + 0],
+                vertices[i * 3 + 1],
+                vertices[i * 3 + 2]);
+            nativeCutterMeshLocalMin = Vector3.Min(nativeCutterMeshLocalMin, vertex);
+            nativeCutterMeshLocalMax = Vector3.Max(nativeCutterMeshLocalMax, vertex);
+        }
+
+        UploadNativeCutterMesh();
+        ClearGpuVisualCuts();
+    }
+
+    public void ClearNativeCutterMesh()
+    {
+        nativeCutterMeshVertices = null;
+        nativeCutterMeshTriangleIndices = null;
+        nativeCutterMeshVertexCount = 0;
+        nativeCutterMeshIndexCount = 0;
+        nativeCutterMeshLocalMin = Vector3.zero;
+        nativeCutterMeshLocalMax = Vector3.zero;
+        nativeCutterActiveVoxelCount = 0;
+        ClearGpuVisualCuts();
+
+        if (!sdfNativeReady)
+        {
+            return;
+        }
+
+        try
+        {
+            SdfNativePlugin.sdf_clear_cutter_mesh();
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native cutter mesh clear failed: {ex.Message}", this);
+            sdfNativeReady = false;
+        }
+    }
+
+    public bool RefreshImportedBlankMeshFromSource()
+    {
+        if (blankShape != WorkpieceBlankShape.ImportedMesh)
+        {
+            return true;
+        }
+
+        if (importedBlankMeshRoot == null ||
+            !TryExtractImportedBlankMesh(
+                importedBlankMeshRoot,
+                out float[] vertices,
+                out int vertexCount,
+                out int[] triangleIndices,
+                out int indexCount))
+        {
+            ClearNativeBlankMesh();
+            Debug.LogWarning(
+                "Imported blank mesh extraction failed. Assign a readable third-party mesh root before using ImportedMesh blank shape.",
+                this);
+            return false;
+        }
+
+        return SetNativeBlankMesh(vertices, vertexCount, triangleIndices, indexCount);
+    }
+
+    public bool SetNativeBlankMesh(
+        float[] vertices,
+        int vertexCount,
+        int[] triangleIndices,
+        int indexCount)
+    {
+        if (vertices == null ||
+            triangleIndices == null ||
+            vertexCount <= 0 ||
+            indexCount < 3 ||
+            vertices.Length < vertexCount * 3 ||
+            triangleIndices.Length < indexCount)
+        {
+            ClearNativeBlankMesh();
+            return false;
+        }
+
+        Vector3 min = new Vector3(vertices[0], vertices[1], vertices[2]);
+        Vector3 max = min;
+        for (int i = 1; i < vertexCount; i++)
+        {
+            Vector3 vertex = new Vector3(
+                vertices[i * 3 + 0],
+                vertices[i * 3 + 1],
+                vertices[i * 3 + 2]);
+            min = Vector3.Min(min, vertex);
+            max = Vector3.Max(max, vertex);
+        }
+
+        if (!ValidateImportedBlankMeshBounds(min, max, out string reason))
+        {
+            ClearNativeBlankMesh();
+            Debug.LogWarning($"Imported blank mesh rejected: {reason}", this);
+            return false;
+        }
+
+        nativeBlankMeshVertexCount = vertexCount;
+        nativeBlankMeshIndexCount = indexCount;
+        nativeBlankMeshVertices = new float[vertexCount * 3];
+        nativeBlankMeshTriangleIndices = new int[indexCount];
+        System.Array.Copy(vertices, nativeBlankMeshVertices, nativeBlankMeshVertices.Length);
+        System.Array.Copy(triangleIndices, nativeBlankMeshTriangleIndices, nativeBlankMeshTriangleIndices.Length);
+        nativeBlankMeshLocalMin = min;
+        nativeBlankMeshLocalMax = max;
+        nativeBlankMeshTriangleCount = indexCount / 3;
+
+        if (sdfNativeReady && blankShape == WorkpieceBlankShape.ImportedMesh)
+        {
+            return UploadNativeBlankMesh();
+        }
+
+        return true;
+    }
+
+    public void ClearNativeBlankMesh()
+    {
+        nativeBlankMeshVertices = null;
+        nativeBlankMeshTriangleIndices = null;
+        nativeBlankMeshVertexCount = 0;
+        nativeBlankMeshIndexCount = 0;
+        nativeBlankMeshLocalMin = Vector3.zero;
+        nativeBlankMeshLocalMax = Vector3.zero;
+        nativeBlankMeshTriangleCount = 0;
+
+        if (!sdfNativeReady)
+        {
+            return;
+        }
+
+        try
+        {
+            SdfNativePlugin.sdf_clear_blank_mesh();
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native blank mesh clear failed: {ex.Message}", this);
+            sdfNativeReady = false;
+        }
+    }
+
+    private bool ValidateImportedBlankMeshBounds(Vector3 min, Vector3 max, out string reason)
+    {
+        Vector3 size = max - min;
+        const float axisTolerance = 0.001f;
+        float envelopeTolerance = Mathf.Max(voxelSize, 0.001f);
+        if (size.x > MaxImportedBlankAxisMm + axisTolerance ||
+            size.y > MaxImportedBlankAxisMm + axisTolerance ||
+            size.z > MaxImportedBlankAxisMm + axisTolerance)
+        {
+            reason =
+                $"axis size {size.x:0.###}x{size.y:0.###}x{size.z:0.###}mm exceeds the 1000mm imported-model limit.";
+            return false;
+        }
+
+        Vector3 stockMin = GetLocalMin();
+        Vector3 stockMax = -stockMin;
+        if (min.x < stockMin.x - envelopeTolerance ||
+            min.y < stockMin.y - envelopeTolerance ||
+            min.z < stockMin.z - envelopeTolerance ||
+            max.x > stockMax.x + envelopeTolerance ||
+            max.y > stockMax.y + envelopeTolerance ||
+            max.z > stockMax.z + envelopeTolerance)
+        {
+            reason =
+                $"bounds {min}..{max} exceed the user-defined stock envelope {stockMin}..{stockMax}.";
+            return false;
+        }
+
+        reason = null;
+        return true;
+    }
+
+    private bool TryExtractImportedBlankMesh(
+        GameObject sourceRoot,
+        out float[] vertices,
+        out int vertexCount,
+        out int[] triangleIndices,
+        out int indexCount)
+    {
+        vertices = null;
+        triangleIndices = null;
+        vertexCount = 0;
+        indexCount = 0;
+
+        if (sourceRoot == null)
+        {
+            return false;
+        }
+
+        List<Vector3> vertexList = new List<Vector3>(4096);
+        List<int> indexList = new List<int>(8192);
+
+        MeshFilter[] filters = sourceRoot.GetComponentsInChildren<MeshFilter>(true);
+        for (int i = 0; i < filters.Length; i++)
+        {
+            AccumulateImportedBlankMesh(filters[i].transform, filters[i].sharedMesh, vertexList, indexList);
+        }
+
+        SkinnedMeshRenderer[] skinnedRenderers = sourceRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+        for (int i = 0; i < skinnedRenderers.Length; i++)
+        {
+            AccumulateImportedBlankMesh(
+                skinnedRenderers[i].transform,
+                skinnedRenderers[i].sharedMesh,
+                vertexList,
+                indexList);
+        }
+
+        if (vertexList.Count <= 0 || indexList.Count < 3)
+        {
+            return false;
+        }
+
+        vertexCount = vertexList.Count;
+        indexCount = indexList.Count;
+        vertices = new float[vertexCount * 3];
+        for (int i = 0; i < vertexList.Count; i++)
+        {
+            Vector3 vertex = vertexList[i];
+            int offset = i * 3;
+            vertices[offset] = vertex.x;
+            vertices[offset + 1] = vertex.y;
+            vertices[offset + 2] = vertex.z;
+        }
+
+        triangleIndices = indexList.ToArray();
+        return true;
+    }
+
+    private void AccumulateImportedBlankMesh(
+        Transform meshTransform,
+        Mesh mesh,
+        List<Vector3> vertices,
+        List<int> triangleIndices)
+    {
+        if (meshTransform == null || mesh == null || !mesh.isReadable)
+        {
+            return;
+        }
+
+        Vector3[] meshVertices = mesh.vertices;
+        int baseIndex = vertices.Count;
+        for (int i = 0; i < meshVertices.Length; i++)
+        {
+            vertices.Add(transform.InverseTransformPoint(meshTransform.TransformPoint(meshVertices[i])));
+        }
+
+        for (int subMesh = 0; subMesh < mesh.subMeshCount; subMesh++)
+        {
+            if (mesh.GetTopology(subMesh) != MeshTopology.Triangles)
+            {
+                continue;
+            }
+
+            int[] indices = mesh.GetIndices(subMesh);
+            for (int i = 0; i + 2 < indices.Length; i += 3)
+            {
+                int a = indices[i];
+                int b = indices[i + 1];
+                int c = indices[i + 2];
+                if (a < 0 || b < 0 || c < 0 ||
+                    a >= meshVertices.Length || b >= meshVertices.Length || c >= meshVertices.Length)
+                {
+                    continue;
+                }
+
+                triangleIndices.Add(baseIndex + a);
+                triangleIndices.Add(baseIndex + b);
+                triangleIndices.Add(baseIndex + c);
+            }
+        }
+    }
+
+    private void UploadCutterAngularProfileBuffers()
+    {
+        int sampleCount = Mathf.Max(1, MaxCutterAngularProfileSamples);
+        if (cutterAngularProfileMinBuffer == null || cutterAngularProfileMinBuffer.count != sampleCount)
+        {
+            ReleaseCutterAngularProfileBuffers();
+            cutterAngularProfileMinBuffer = new ComputeBuffer(sampleCount, sizeof(float));
+            cutterAngularProfileMaxBuffer = new ComputeBuffer(sampleCount, sizeof(float));
+        }
+
+        cutterAngularProfileMinBuffer.SetData(cutterAngularProfileMinRadiusSamples);
+        cutterAngularProfileMaxBuffer.SetData(cutterAngularProfileMaxRadiusSamples);
+    }
+
+    private bool EnsureCutterAngularProfileBuffers()
+    {
+        if (!HasAngularCutterProfile)
+        {
+            return false;
+        }
+
+        if (cutterAngularProfileMinBuffer == null ||
+            cutterAngularProfileMaxBuffer == null ||
+            cutterAngularProfileMinBuffer.count != MaxCutterAngularProfileSamples ||
+            cutterAngularProfileMaxBuffer.count != MaxCutterAngularProfileSamples)
+        {
+            UploadCutterAngularProfileBuffers();
+        }
+
+        return cutterAngularProfileMinBuffer != null && cutterAngularProfileMaxBuffer != null;
+    }
+
+    private void ReleaseCutterAngularProfileBuffers()
+    {
+        if (cutterAngularProfileMinBuffer != null)
+        {
+            cutterAngularProfileMinBuffer.Release();
+            cutterAngularProfileMinBuffer = null;
+        }
+
+        if (cutterAngularProfileMaxBuffer != null)
+        {
+            cutterAngularProfileMaxBuffer.Release();
+            cutterAngularProfileMaxBuffer = null;
+        }
     }
 
     private void EnforceSdfAllocationBudget()
@@ -547,12 +1018,23 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         ReleaseGpuSdfResources();
         gpuVisualCutOperations.Clear();
         gpuVisualCutsDirty = true;
-        gpuDetachedRemovalBoxes.Clear();
-        gpuDetachedRemovalsDirty = true;
-        globalVisualConnectivityDirty = false;
-        lastGlobalVisualCutTime = 0f;
-        InitializeBlockVoxels();
-        InitializeSdfSamples();
+        if (surfaceMode == WorkpieceSurfaceMode.BlockyVoxels)
+        {
+            InitializeBlockVoxels();
+            sdfSamples = null;
+        }
+        else
+        {
+            voxels = null;
+            if (UsesGpuSurfaceRendering)
+            {
+                sdfSamples = null;
+            }
+            else
+            {
+                InitializeSdfSamples();
+            }
+        }
         InitializeGpuSdfResources();
         InitializeNativeSdfPlugin();
 
@@ -576,67 +1058,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         }
     }
 
-    public bool CutSphere(Vector3 worldCenter, float worldRadius)
-    {
-        return CutSphere(worldCenter, worldRadius, true, out _);
-    }
-
-    public bool CutSphere(Vector3 worldCenter, float worldRadius, out int removedVoxelCount)
-    {
-        return CutSphere(worldCenter, worldRadius, true, out removedVoxelCount);
-    }
-
-    public bool CutSphere(Vector3 worldCenter, float worldRadius, bool rebuildMesh)
-    {
-        return CutSphere(worldCenter, worldRadius, rebuildMesh, out _);
-    }
-
-    public bool CutSphere(Vector3 worldCenter, float worldRadius, bool rebuildMesh, out int removedVoxelCount)
-    {
-        return CutSweptSphere(worldCenter, worldCenter, worldRadius, rebuildMesh, out removedVoxelCount);
-    }
-
-    public bool CutSweptSphere(Vector3 worldStart, Vector3 worldEnd, float worldRadius)
-    {
-        return CutSweptSphere(worldStart, worldEnd, worldRadius, true, out _);
-    }
-
-    public bool CutSweptSphere(Vector3 worldStart, Vector3 worldEnd, float worldRadius, bool rebuildMesh)
-    {
-        return CutSweptSphere(worldStart, worldEnd, worldRadius, rebuildMesh, out _);
-    }
-
-    public bool CutSweptSphere(Vector3 worldStart, Vector3 worldEnd, float worldRadius, bool rebuildMesh, out int removedVoxelCount)
-    {
-        removedVoxelCount = 0;
-
-        if (worldRadius <= 0f)
-        {
-            return false;
-        }
-
-        if (!IsInitialized)
-        {
-            ResetWorkpiece();
-        }
-
-        bool changed = surfaceMode == WorkpieceSurfaceMode.SmoothSdf
-            ? CutCapsuleSdf(worldStart, worldEnd, worldRadius, out removedVoxelCount)
-            : CutCapsuleVoxels(worldStart, worldEnd, worldRadius, out removedVoxelCount);
-
-        if (!changed)
-        {
-            return false;
-        }
-
-        if (rebuildMesh)
-        {
-            RebuildMesh();
-        }
-
-        return true;
-    }
-
     public bool CutSweptProfileCutter(Vector3 worldStart, Vector3 worldEnd, Vector3 worldAxis, float worldRadius, float worldHeight, bool rebuildMesh)
     {
         int changedSampleCount;
@@ -649,6 +1070,53 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             worldHeight,
             rebuildMesh,
             out changedSampleCount);
+    }
+
+    public bool CutSphere(Vector3 worldCenter, float worldRadius, bool rebuildMesh)
+    {
+        return CutSweptSphere(worldCenter, worldCenter, worldRadius, rebuildMesh);
+    }
+
+    public bool CutSweptSphere(Vector3 worldStart, Vector3 worldEnd, float worldRadius, bool rebuildMesh)
+    {
+        int changedSampleCount;
+        return CutSweptSphere(worldStart, worldEnd, worldRadius, rebuildMesh, out changedSampleCount);
+    }
+
+    public bool CutSweptSphere(
+        Vector3 worldStart,
+        Vector3 worldEnd,
+        float worldRadius,
+        bool rebuildMesh,
+        out int changedSampleCount)
+    {
+        changedSampleCount = 0;
+
+        if (worldRadius <= 0f)
+        {
+            return false;
+        }
+
+        if (!IsInitialized)
+        {
+            ResetWorkpiece();
+        }
+
+        bool changed = surfaceMode == WorkpieceSurfaceMode.SmoothSdf
+            ? CutNativeCapsuleSdf(worldStart, worldEnd, worldRadius, out changedSampleCount)
+            : false;
+
+        if (!changed)
+        {
+            return false;
+        }
+
+        if (rebuildMesh)
+        {
+            RebuildMesh();
+        }
+
+        return true;
     }
 
     public bool CutSweptProfileCutter(Vector3 worldStart, Vector3 worldEnd, Vector3 worldAxis, float worldRadius, float worldHeight, bool rebuildMesh, out int changedSampleCount)
@@ -708,7 +1176,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         }
 
         bool changed = surfaceMode == WorkpieceSurfaceMode.SmoothSdf
-            ? CutProfileCutterSdf(
+            ? CutSelectedNativeCutterSdf(
                 worldStart,
                 worldEnd,
                 worldAxis,
@@ -774,6 +1242,13 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         RebuildMeshImmediate();
     }
 
+    public void ClearDisplayOverlays()
+    {
+        ClearGpuVisualCuts();
+        CancelNativeCutDetailRebuild();
+        ClearNativeCutDetailDisplay(false);
+    }
+
     public void RequestRebuildMesh()
     {
         if (!IsInitialized)
@@ -830,60 +1305,85 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             ResetWorkpiece();
         }
 
-        if (surfaceMode != WorkpieceSurfaceMode.SmoothSdf || !removeDetachedParts)
+        if (surfaceMode != WorkpieceSurfaceMode.SmoothSdf || !sdfNativeReady)
         {
             return;
         }
 
-        if (UsesGpuSurfaceRendering)
+        SdfNativePlugin.sdf_check_connectivity();
+        int timeout = 500;
+        int removed = SdfNativePlugin.sdf_try_apply_connectivity_cleanup();
+        while (removed < 0 && timeout > 0)
         {
-            if (!useExpandedDisplayBounds)
-            {
-                TryRemoveUnsupportedSdfColumnsGpuNoReadback();
-            }
-
-            // Use native plugin for GPU mode
-            if (sdfNativeReady)
-            {
-                SdfNativePlugin.sdf_check_connectivity();
-                // Spin-wait for result (ContextMenu is manual, OK to block briefly)
-                int timeout = 500;
-                while (SdfNativePlugin.sdf_is_connectivity_ready() == 0 && timeout > 0)
-                {
-                    System.Threading.Thread.Sleep(1);
-                    timeout--;
-                }
-                if (SdfNativePlugin.sdf_is_connectivity_ready() != 0)
-                {
-                    if (SdfNativePlugin.sdf_get_connectivity_result() != 0)
-                    {
-                        int removed = SdfNativePlugin.sdf_apply_removal();
-                        if (removed > 0)
-                        {
-                            UploadSdfFromNative();
-                            Debug.Log($"Native plugin removed {removed} island cells.", this);
-                        }
-                    }
-                    else
-                    {
-                        SdfNativePlugin.sdf_consume_connectivity_result();
-                    }
-
-                    nativeConnectivityInFlight = false;
-                    nativeConnectivityDirty = false;
-                }
-            }
-            return;
+            System.Threading.Thread.Sleep(1);
+            removed = SdfNativePlugin.sdf_try_apply_connectivity_cleanup();
+            timeout--;
         }
 
-        if (sdfSamples == null)
+        if (removed < 0)
         {
             return;
         }
 
-        if (RemoveDetachedSdfComponents() > 0)
+        int componentCount = SdfNativePlugin.sdf_get_last_connectivity_component_count();
+        int keepCoreCount = SdfNativePlugin.sdf_get_last_connectivity_keep_core_count();
+        int removalCandidateCount = SdfNativePlugin.sdf_get_last_connectivity_removal_candidate_count();
+        if (removed > 0)
         {
-            RebuildMesh();
+            ClearGpuVisualCuts();
+            ClearNativeCutDetailDisplay(false);
+            UploadSdfFromNative();
+            RequestRebuildMesh();
+        }
+
+        Debug.Log(
+            $"DETACHED_CLEANUP_MANUAL_RESULT components={componentCount} " +
+            $"keepCore={keepCoreCount} removalCandidates={removalCandidateCount} removed={removed} " +
+            NativeConnectivitySummary("manual-cleanup"),
+            this);
+
+        nativeConnectivityInFlight = false;
+        nativeConnectivityDirty = removed > 0;
+        nextNativeConnectivityCheckTime = nativeConnectivityDirty && Application.isPlaying
+            ? Time.time + Mathf.Max(0.01f, detachedCleanupInterval)
+            : 0f;
+    }
+
+    [ContextMenu("Log Native Material Diagnostics")]
+    public void LogNativeMaterialDiagnostics()
+    {
+        if (!IsInitialized)
+        {
+            ResetWorkpiece();
+        }
+
+        Debug.Log(NativeConnectivitySummary("manual-diagnostic"), this);
+    }
+
+    private string NativeConnectivitySummary(string label)
+    {
+        if (!sdfNativeReady)
+        {
+            return $"NATIVE_MATERIAL_DIAGNOSTIC label={label} plugin={SdfNativePlugin.PluginName} ready=false";
+        }
+
+        try
+        {
+            int ok = SdfNativePlugin.sdf_debug_connectivity_summary(
+                out int solidSamples,
+                out int coreSolidSamples,
+                out int components,
+                out int keepCore,
+                out int removalCandidates);
+            return ok != 0
+                ? $"NATIVE_MATERIAL_DIAGNOSTIC label={label} plugin={SdfNativePlugin.PluginName} " +
+                  $"solid={solidSamples} coreSolid={coreSolidSamples} components={components} " +
+                  $"keepCore={keepCore} removalCandidates={removalCandidates}"
+                : $"NATIVE_MATERIAL_DIAGNOSTIC label={label} plugin={SdfNativePlugin.PluginName} ready=false";
+        }
+        catch (System.Exception ex)
+        {
+            return $"NATIVE_MATERIAL_DIAGNOSTIC label={label} plugin={SdfNativePlugin.PluginName} error={ex.Message}";
         }
     }
 
@@ -1540,7 +2040,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             return false;
         }
 
-        ComputeShader shader = GetSdfCutCompute();
+        ComputeShader shader = GetSdfDisplayBufferCompute();
         if (shader == null)
         {
             return false;
@@ -1556,11 +2056,9 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         try
         {
-            sdfCutCompute = shader;
-            sdfCutKernel = sdfCutCompute.FindKernel("CutCapsuleSdf");
-            sdfProfileCutterKernel = sdfCutCompute.FindKernel("CutProfileCutterSdf");
-            sdfInitKernel = sdfCutCompute.FindKernel("InitializeBoxSdf");
-            sdfRemoveUnsupportedColumnsKernel = sdfCutCompute.FindKernel("RemoveUnsupportedColumnsSdf");
+            sdfDisplayBufferCompute = shader;
+            sdfInitKernel = sdfDisplayBufferCompute.FindKernel("InitializeBoxSdf");
+            sdfCopyRegionKernel = sdfDisplayBufferCompute.FindKernel("CopySdfRegion");
 
             sdfSampleBuffer = new ComputeBuffer(sampleCount, sizeof(float));
             if (UsesGpuSurfaceRendering)
@@ -1574,28 +2072,27 @@ public sealed class WorkpieceVoxel : MonoBehaviour
                 sdfSampleBuffer.SetData(sdfLinearSamples);
             }
 
-            sdfChangedCounterBuffer = new ComputeBuffer(1, sizeof(int));
             sdfGpuReady = true;
             return true;
         }
         catch (System.Exception exception)
         {
-            Debug.LogWarning($"GPU SDF cutting disabled: {exception.Message}", this);
+            Debug.LogWarning($"GPU SDF display buffer disabled: {exception.Message}", this);
             sdfGpuUnavailable = true;
             ReleaseGpuSdfResources();
             return false;
         }
     }
 
-    private ComputeShader GetSdfCutCompute()
+    private ComputeShader GetSdfDisplayBufferCompute()
     {
-        if (sdfCutCompute != null)
+        if (sdfDisplayBufferCompute != null)
         {
-            return sdfCutCompute;
+            return sdfDisplayBufferCompute;
         }
 
-        sdfCutCompute = Resources.Load<ComputeShader>("Cutting/WorkpieceSdfCut");
-        return sdfCutCompute;
+        sdfDisplayBufferCompute = Resources.Load<ComputeShader>("Cutting/WorkpieceSdfDisplayBuffer");
+        return sdfDisplayBufferCompute;
     }
 
     private void ReleaseGpuSdfResources()
@@ -1606,85 +2103,30 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             sdfSampleBuffer = null;
         }
 
-        if (sdfChangedCounterBuffer != null)
+        if (sdfRegionUploadBuffer != null)
         {
-            sdfChangedCounterBuffer.Release();
-            sdfChangedCounterBuffer = null;
+            sdfRegionUploadBuffer.Release();
+            sdfRegionUploadBuffer = null;
         }
 
+        sdfRegionUploadBufferCapacity = 0;
         sdfGpuReady = false;
-        sdfCutKernel = -1;
-        sdfProfileCutterKernel = -1;
         sdfInitKernel = -1;
-        sdfRemoveUnsupportedColumnsKernel = -1;
+        sdfCopyRegionKernel = -1;
     }
 
     private void DispatchGpuSdfInitialization()
     {
-        sdfCutCompute.SetBuffer(sdfInitKernel, "_SdfSamples", sdfSampleBuffer);
-        sdfCutCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
-        sdfCutCompute.SetVector("_GridMin", GetLocalMin());
-        sdfCutCompute.SetVector("_LocalSize", LocalSize);
-        sdfCutCompute.SetFloat("_VoxelSize", voxelSize);
+        sdfDisplayBufferCompute.SetBuffer(sdfInitKernel, "_SdfSamples", sdfSampleBuffer);
+        sdfDisplayBufferCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
+        sdfDisplayBufferCompute.SetVector("_GridMin", GetLocalMin());
+        sdfDisplayBufferCompute.SetVector("_LocalSize", LocalSize);
+        sdfDisplayBufferCompute.SetFloat("_VoxelSize", voxelSize);
 
         int threadGroupsX = Mathf.CeilToInt(SampleWidth / 8f);
         int threadGroupsY = Mathf.CeilToInt(SampleHeight / 8f);
         int threadGroupsZ = Mathf.CeilToInt(SampleDepth / 4f);
-        sdfCutCompute.Dispatch(sdfInitKernel, threadGroupsX, threadGroupsY, threadGroupsZ);
-    }
-
-    private bool TryRemoveUnsupportedSdfColumnsGpuNoReadback()
-    {
-        if (!useGpuDetachedCleanup || !EnsureGpuSdfResources() || sdfRemoveUnsupportedColumnsKernel < 0)
-        {
-            return false;
-        }
-
-        try
-        {
-            sdfChangedCounterData[0] = 0;
-            sdfChangedCounterBuffer.SetData(sdfChangedCounterData);
-
-            sdfCutCompute.SetBuffer(sdfRemoveUnsupportedColumnsKernel, "_SdfSamples", sdfSampleBuffer);
-            sdfCutCompute.SetBuffer(sdfRemoveUnsupportedColumnsKernel, "_ChangedCounter", sdfChangedCounterBuffer);
-            sdfCutCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
-            sdfCutCompute.SetVector("_GridMin", GetLocalMin());
-            sdfCutCompute.SetVector("_LocalSize", LocalSize);
-            sdfCutCompute.SetFloat("_VoxelSize", voxelSize);
-            sdfCutCompute.SetFloat("_IsoLevel", IsoLevel);
-            sdfCutCompute.SetFloat("_DetachedAirValue", Mathf.Max(voxelSize * 0.25f, voxelSize * gpuDetachedAirValueVoxels));
-
-            int threadGroupsX = Mathf.CeilToInt(SampleWidth / 8f);
-            int threadGroupsZ = Mathf.CeilToInt(SampleDepth / 8f);
-            sdfCutCompute.Dispatch(sdfRemoveUnsupportedColumnsKernel, threadGroupsX, 1, threadGroupsZ);
-            return true;
-        }
-        catch (System.Exception exception)
-        {
-            Debug.LogWarning($"GPU detached cleanup failed: {exception.Message}", this);
-            sdfGpuUnavailable = true;
-            ReleaseGpuSdfResources();
-            return false;
-        }
-    }
-
-    private void TryCleanupDetachedPartsGpuIfDue()
-    {
-        if (!removeDetachedParts || !useGpuDetachedCleanup ||
-            !UsesGpuSurfaceRendering || useExpandedDisplayBounds)
-        {
-            return;
-        }
-
-        if (Application.isPlaying && Time.time < nextDetachedCleanupTime)
-        {
-            return;
-        }
-
-        nextDetachedCleanupTime = Application.isPlaying
-            ? Time.time + Mathf.Max(0.01f, detachedCleanupInterval)
-            : 0f;
-        TryRemoveUnsupportedSdfColumnsGpuNoReadback();
+        sdfDisplayBufferCompute.Dispatch(sdfInitKernel, threadGroupsX, threadGroupsY, threadGroupsZ);
     }
 
     private void UploadSdfSamplesToGpu()
@@ -1706,6 +2148,37 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         {
             sdfLinearSamples = new float[sampleCount];
         }
+    }
+
+    private void EnsureSdfRegionSamples(int sampleCount)
+    {
+        if (sdfRegionSamples == null || sdfRegionSamples.Length < sampleCount)
+        {
+            sdfRegionSamples = new float[sampleCount];
+        }
+    }
+
+    private bool EnsureSdfRegionUploadBuffer(int sampleCount)
+    {
+        if (!sdfGpuReady || sdfSampleBuffer == null || sdfCopyRegionKernel < 0 || sampleCount <= 0)
+        {
+            return false;
+        }
+
+        if (sdfRegionUploadBuffer != null && sdfRegionUploadBufferCapacity >= sampleCount)
+        {
+            return true;
+        }
+
+        if (sdfRegionUploadBuffer != null)
+        {
+            sdfRegionUploadBuffer.Release();
+            sdfRegionUploadBuffer = null;
+        }
+
+        sdfRegionUploadBufferCapacity = Mathf.NextPowerOfTwo(Mathf.Max(1, sampleCount));
+        sdfRegionUploadBuffer = new ComputeBuffer(sdfRegionUploadBufferCapacity, sizeof(float));
+        return true;
     }
 
     private void CopySdfSamplesToLinear()
@@ -1739,6 +2212,110 @@ public sealed class WorkpieceVoxel : MonoBehaviour
     private int GetSdfSampleIndex(int x, int y, int z)
     {
         return x + SampleWidth * (y + SampleHeight * z);
+    }
+
+    private bool UploadSdfRegionFromNative(int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
+    {
+        if (!sdfNativeReady)
+        {
+            return false;
+        }
+
+        minX = ClampIndex(minX, SampleWidth);
+        maxX = ClampIndex(maxX, SampleWidth);
+        minY = ClampIndex(minY, SampleHeight);
+        maxY = ClampIndex(maxY, SampleHeight);
+        minZ = ClampIndex(minZ, SampleDepth);
+        maxZ = ClampIndex(maxZ, SampleDepth);
+
+        if (maxX < minX || maxY < minY || maxZ < minZ)
+        {
+            return false;
+        }
+
+        int countX = maxX - minX + 1;
+        int countY = maxY - minY + 1;
+        int countZ = maxZ - minZ + 1;
+        int sampleCount = countX * countY * countZ;
+        if (sampleCount <= 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            EnsureSdfRegionSamples(sampleCount);
+            int written = SdfNativePlugin.sdf_get_region(
+                sdfRegionSamples,
+                sampleCount,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ);
+            if (written != sampleCount)
+            {
+                Debug.LogWarning(
+                    $"Native SDF region upload returned {written} samples, expected {sampleCount}.",
+                    this);
+                return false;
+            }
+
+            if (sdfSamples != null)
+            {
+                int src = 0;
+                for (int z = minZ; z <= maxZ; z++)
+                {
+                    for (int y = minY; y <= maxY; y++)
+                    {
+                        for (int x = minX; x <= maxX; x++)
+                        {
+                            sdfSamples[x, y, z] = sdfRegionSamples[src];
+                            src++;
+                        }
+                    }
+                }
+            }
+
+            if (sdfSampleBuffer != null)
+            {
+                if (EnsureSdfRegionUploadBuffer(sampleCount))
+                {
+                    sdfRegionUploadBuffer.SetData(sdfRegionSamples, 0, 0, sampleCount);
+                    sdfDisplayBufferCompute.SetBuffer(sdfCopyRegionKernel, "_SdfSamples", sdfSampleBuffer);
+                    sdfDisplayBufferCompute.SetBuffer(sdfCopyRegionKernel, "_SdfRegionSamples", sdfRegionUploadBuffer);
+                    sdfDisplayBufferCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
+                    sdfDisplayBufferCompute.SetInts("_RegionMin", minX, minY, minZ);
+                    sdfDisplayBufferCompute.SetInts("_RegionSize", countX, countY, countZ);
+
+                    int threadGroupsX = Mathf.CeilToInt(countX / 8f);
+                    int threadGroupsY = Mathf.CeilToInt(countY / 8f);
+                    int threadGroupsZ = Mathf.CeilToInt(countZ / 4f);
+                    sdfDisplayBufferCompute.Dispatch(sdfCopyRegionKernel, threadGroupsX, threadGroupsY, threadGroupsZ);
+                }
+                else
+                {
+                    int src = 0;
+                    for (int z = minZ; z <= maxZ; z++)
+                    {
+                        for (int y = minY; y <= maxY; y++)
+                        {
+                            int dst = GetSdfSampleIndex(minX, y, z);
+                            sdfSampleBuffer.SetData(sdfRegionSamples, src, dst, countX);
+                            src += countX;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native SDF region upload failed: {ex.Message}", this);
+            return false;
+        }
     }
 
     private bool EnsureGpuSurfaceResources()
@@ -1795,6 +2372,8 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
     private void ReleaseGpuSurfaceResources()
     {
+        CancelNativeCutDetailRebuild();
+
         if (runtimeGpuSurfaceMaterial != null && runtimeGpuSurfaceMaterial != gpuSurfaceMaterial)
         {
             DestroyRuntimeObject(runtimeGpuSurfaceMaterial);
@@ -1817,27 +2396,24 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             gpuVisualCutBuffer = null;
         }
 
-        if (gpuDetachedRemovalBuffer != null)
+        if (nativeCutDetailBuffer != null)
         {
-            gpuDetachedRemovalBuffer.Release();
-            gpuDetachedRemovalBuffer = null;
+            nativeCutDetailBuffer.Release();
+            nativeCutDetailBuffer = null;
         }
 
-        if (gpuDetachedVoxelMaskBuffer != null)
+        if (nativeCutDetailTileBuffer != null)
         {
-            gpuDetachedVoxelMaskBuffer.Release();
-            gpuDetachedVoxelMaskBuffer = null;
+            nativeCutDetailTileBuffer.Release();
+            nativeCutDetailTileBuffer = null;
         }
 
         gpuVisualCutBufferCapacity = 0;
         gpuVisualCutsDirty = true;
-        gpuDetachedRemovalBufferCapacity = 0;
-        gpuDetachedRemovalsDirty = true;
-        gpuDetachedVoxelMaskCapacity = 0;
-        gpuDetachedVoxelMaskSize = Vector3Int.zero;
-        gpuDetachedVoxelMaskMin = Vector3.zero;
-        gpuDetachedVoxelMaskStep = Vector3.one;
-        gpuDetachedVoxelMaskAirValue = 0f;
+        nativeCutDetailBufferCapacity = 0;
+        nativeCutDetailTileBufferCapacity = 0;
+        nativeCutDetailTiles.Clear();
+        nativeCutDetailReady = false;
     }
 
     private void RebuildGpuSurface()
@@ -1918,23 +2494,21 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         runtimeGpuSurfaceMaterial.SetVector("_DisplayCenter", DisplayCenter);
         EnsureGpuVisualCutBuffer();
         runtimeGpuSurfaceMaterial.SetBuffer("_VisualCutOperations", gpuVisualCutBuffer);
-        runtimeGpuSurfaceMaterial.SetInt("_VisualCutOperationCount", gpuVisualCutOperations.Count);
-        EnsureGpuDetachedRemovalBuffer();
-        runtimeGpuSurfaceMaterial.SetBuffer("_DetachedRemovalBoxes", gpuDetachedRemovalBuffer);
-        runtimeGpuSurfaceMaterial.SetInt("_DetachedRemovalBoxCount", gpuDetachedRemovalBoxes.Count);
-        EnsureGpuDetachedVoxelMaskBuffer();
-        runtimeGpuSurfaceMaterial.SetBuffer("_DetachedVoxelMask", gpuDetachedVoxelMaskBuffer);
-        runtimeGpuSurfaceMaterial.SetVector(
-            "_DetachedVoxelMaskSize",
-            new Vector4(gpuDetachedVoxelMaskSize.x, gpuDetachedVoxelMaskSize.y, gpuDetachedVoxelMaskSize.z, 0f));
-        runtimeGpuSurfaceMaterial.SetVector("_DetachedVoxelMaskMin", gpuDetachedVoxelMaskMin);
-        runtimeGpuSurfaceMaterial.SetVector("_DetachedVoxelMaskStep", gpuDetachedVoxelMaskStep);
-        runtimeGpuSurfaceMaterial.SetFloat("_DetachedVoxelMaskAirValue", gpuDetachedVoxelMaskAirValue);
+        runtimeGpuSurfaceMaterial.SetInt("_VisualCutOperationCount", 0);
+        EnsureNativeCutDetailBuffer();
+        EnsureNativeCutDetailTileBuffer();
+        runtimeGpuSurfaceMaterial.SetBuffer("_NativeCutDetailSamples", nativeCutDetailBuffer);
+        runtimeGpuSurfaceMaterial.SetBuffer("_NativeCutDetailTiles", nativeCutDetailTileBuffer);
+        runtimeGpuSurfaceMaterial.SetInt("_NativeCutDetailEnabled", 0);
+        runtimeGpuSurfaceMaterial.SetInt("_NativeCutDetailTileCount", 0);
         runtimeGpuSurfaceMaterial.SetInt("_ProfileSegmentCount", profileSegmentCount);
         runtimeGpuSurfaceMaterial.SetInt("_AngularProfileAxialSampleCount", cutterAngularProfileAxialSampleCount);
         runtimeGpuSurfaceMaterial.SetInt("_AngularProfileAngleSampleCount", cutterAngularProfileAngleSampleCount);
-        runtimeGpuSurfaceMaterial.SetFloatArray("_AngularProfileMinRadiusSamples", cutterAngularProfileMinRadiusSamples);
-        runtimeGpuSurfaceMaterial.SetFloatArray("_AngularProfileMaxRadiusSamples", cutterAngularProfileMaxRadiusSamples);
+        if (EnsureCutterAngularProfileBuffers())
+        {
+            runtimeGpuSurfaceMaterial.SetBuffer("_AngularProfileMinRadiusSamples", cutterAngularProfileMinBuffer);
+            runtimeGpuSurfaceMaterial.SetBuffer("_AngularProfileMaxRadiusSamples", cutterAngularProfileMaxBuffer);
+        }
         runtimeGpuSurfaceMaterial.SetFloat("_VoxelSize", voxelSize);
         runtimeGpuSurfaceMaterial.SetFloat("_IsoLevel", IsoLevel);
         runtimeGpuSurfaceMaterial.SetFloat("_MaxSteps", Mathf.Max(16, gpuRaymarchMaxSteps));
@@ -1969,147 +2543,7 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         return bounds;
     }
 
-    private bool CutCapsuleVoxels(Vector3 worldStart, Vector3 worldEnd, float worldRadius, out int removedVoxelCount)
-    {
-        removedVoxelCount = 0;
-
-        Vector3 localStart = transform.InverseTransformPoint(worldStart);
-        Vector3 localEnd = transform.InverseTransformPoint(worldEnd);
-        float localRadius = WorldDistanceToLocalDistance(worldRadius);
-        float localRadiusSqr = localRadius * localRadius;
-
-        Vector3 min = GetLocalMin();
-        Vector3 segmentMin = Vector3.Min(localStart, localEnd);
-        Vector3 segmentMax = Vector3.Max(localStart, localEnd);
-        Vector3 localMin = segmentMin - Vector3.one * localRadius;
-        Vector3 localMax = segmentMax + Vector3.one * localRadius;
-
-        int minX = ClampIndex(Mathf.FloorToInt((localMin.x - min.x) / voxelSize), width);
-        int maxX = ClampIndex(Mathf.FloorToInt((localMax.x - min.x) / voxelSize), width);
-        int minY = ClampIndex(Mathf.FloorToInt((localMin.y - min.y) / voxelSize), height);
-        int maxY = ClampIndex(Mathf.FloorToInt((localMax.y - min.y) / voxelSize), height);
-        int minZ = ClampIndex(Mathf.FloorToInt((localMin.z - min.z) / voxelSize), depth);
-        int maxZ = ClampIndex(Mathf.FloorToInt((localMax.z - min.z) / voxelSize), depth);
-
-        for (int x = minX; x <= maxX; x++)
-        {
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int z = minZ; z <= maxZ; z++)
-                {
-                    if (!voxels[x, y, z])
-                    {
-                        continue;
-                    }
-
-                    Vector3 voxelCenter = GetVoxelCenterLocal(x, y, z, min);
-                    Vector3 closest = ClosestPointOnSegment(localStart, localEnd, voxelCenter);
-                    if ((voxelCenter - closest).sqrMagnitude <= localRadiusSqr)
-                    {
-                        voxels[x, y, z] = false;
-                        removedVoxelCount++;
-                    }
-                }
-            }
-        }
-
-        return removedVoxelCount > 0;
-    }
-
-    private bool CutCapsuleSdf(Vector3 worldStart, Vector3 worldEnd, float worldRadius, out int changedSampleCount)
-    {
-        changedSampleCount = 0;
-
-        Vector3 localStart = transform.InverseTransformPoint(worldStart);
-        Vector3 localEnd = transform.InverseTransformPoint(worldEnd);
-        float localRadius = WorldDistanceToLocalDistance(worldRadius);
-        float updateBand = voxelSize * 2f;
-        float affectedRadius = localRadius + updateBand;
-
-        Vector3 min = GetLocalMin();
-        Vector3 segmentMin = Vector3.Min(localStart, localEnd);
-        Vector3 segmentMax = Vector3.Max(localStart, localEnd);
-        Vector3 localMin = segmentMin - Vector3.one * affectedRadius;
-        Vector3 localMax = segmentMax + Vector3.one * affectedRadius;
-
-        int minX = ClampIndex(Mathf.FloorToInt((localMin.x - min.x) / voxelSize) + 1, SampleWidth);
-        int maxX = ClampIndex(Mathf.CeilToInt((localMax.x - min.x) / voxelSize) + 1, SampleWidth);
-        int minY = ClampIndex(Mathf.FloorToInt((localMin.y - min.y) / voxelSize) + 1, SampleHeight);
-        int maxY = ClampIndex(Mathf.CeilToInt((localMax.y - min.y) / voxelSize) + 1, SampleHeight);
-        int minZ = ClampIndex(Mathf.FloorToInt((localMin.z - min.z) / voxelSize) + 1, SampleDepth);
-        int maxZ = ClampIndex(Mathf.CeilToInt((localMax.z - min.z) / voxelSize) + 1, SampleDepth);
-
-        if (UsesGpuSurfaceRendering)
-        {
-            if (TryCutCapsuleSdfGpuNoReadback(localStart, localEnd, localRadius, affectedRadius, minX, maxX, minY, maxY, minZ, maxZ))
-            {
-                NativeCutCapsule(localStart, localEnd, localRadius, minX, maxX, minY, maxY, minZ, maxZ);
-                TryCleanupDetachedPartsGpuIfDue();
-                changedSampleCount = 1;
-                return true;
-            }
-
-            return false;
-        }
-
-        Vector3 priorityPoint = localEnd - Vector3.up * localRadius;
-
-        bool gpuUpdated = TryCutCapsuleSdfGpu(
-            localStart,
-            localEnd,
-            localRadius,
-            affectedRadius,
-            minX,
-            maxX,
-            minY,
-            maxY,
-            minZ,
-            maxZ,
-            out changedSampleCount,
-            out priorityPoint);
-
-        if (!gpuUpdated)
-        {
-            changedSampleCount = CutCapsuleSdfCpu(
-                localStart,
-                localEnd,
-                localRadius,
-                affectedRadius,
-                minX,
-                maxX,
-                minY,
-                maxY,
-                minZ,
-                maxZ,
-                out priorityPoint);
-
-            if (changedSampleCount > 0)
-            {
-                UploadSdfSamplesToGpu();
-            }
-        }
-
-        if (changedSampleCount > 0 && UsesChunkedSmoothMesh)
-        {
-            MarkDirtyCells(
-                Mathf.Max(0, minX - 1),
-                Mathf.Min(CellWidth, maxX + 1),
-                Mathf.Max(0, minY - 1),
-                Mathf.Min(CellHeight, maxY + 1),
-                Mathf.Max(0, minZ - 1),
-                Mathf.Min(CellDepth, maxZ + 1),
-                priorityPoint);
-        }
-
-        if (changedSampleCount > 0 && ShouldCleanupDetachedParts())
-        {
-            changedSampleCount += RemoveDetachedSdfComponents();
-        }
-
-        return changedSampleCount > 0;
-    }
-
-    private bool CutProfileCutterSdf(
+    private bool CutSelectedNativeCutterSdf(
         Vector3 worldStart,
         Vector3 worldEnd,
         Vector3 worldAxis,
@@ -2129,19 +2563,36 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         float updateBand = voxelSize * 2f;
         float affectedRadius = localRadius + updateBand;
+        bool useMeshCutter = HasNativeMeshCutter &&
+            (preferNativeMeshCutter || cutterProfileRadiusSampleCount < 2);
 
-        Vector3 startTop = localStart + localAxis * localHeight;
-        Vector3 endTop = localEnd + localAxis * localHeight;
-        Vector3 localMin = Vector3.Min(Vector3.Min(localStart, localEnd), Vector3.Min(startTop, endTop)) - Vector3.one * affectedRadius;
-        Vector3 localMax = Vector3.Max(Vector3.Max(localStart, localEnd), Vector3.Max(startTop, endTop)) + Vector3.one * affectedRadius;
-        bool visualChanged = RegisterGpuVisualProfileCut(localStart, localEnd, localAxis, localRight, localRadius, localHeight, localMin, localMax);
+        Vector3 localMin;
+        Vector3 localMax;
+        if (useMeshCutter)
+        {
+            GetNativeCutterSweepBounds(localStart, localEnd, localAxis, localRight, updateBand, out localMin, out localMax);
+        }
+        else
+        {
+            Vector3 startTop = localStart + localAxis * localHeight;
+            Vector3 endTop = localEnd + localAxis * localHeight;
+            localMin = Vector3.Min(Vector3.Min(localStart, localEnd), Vector3.Min(startTop, endTop)) - Vector3.one * affectedRadius;
+            localMax = Vector3.Max(Vector3.Max(localStart, localEnd), Vector3.Max(startTop, endTop)) + Vector3.one * affectedRadius;
+        }
 
         Vector3 detailMin = GetLocalMin() - Vector3.one * updateBand;
         Vector3 detailMax = -GetLocalMin() + Vector3.one * updateBand;
         if (!AabbOverlaps(localMin, localMax, detailMin, detailMax))
         {
-            changedSampleCount = visualChanged ? 1 : 0;
-            return visualChanged;
+            if (logNativeCutDiagnostics && Application.isPlaying && Time.time >= nextNativeNoOverlapLogTime)
+            {
+                nextNativeNoOverlapLogTime = Time.time + 1f;
+                Debug.Log(
+                    $"Native selected cutter skipped: sweep bounds outside workpiece. " +
+                    $"sweepMin={localMin}, sweepMax={localMax}, workpieceMin={detailMin}, workpieceMax={detailMax}.",
+                    this);
+            }
+            return false;
         }
 
         Vector3 min = GetLocalMin();
@@ -2152,94 +2603,223 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         int minZ = ClampIndex(Mathf.FloorToInt((localMin.z - min.z) / voxelSize) + 1, SampleDepth);
         int maxZ = ClampIndex(Mathf.CeilToInt((localMax.z - min.z) / voxelSize) + 1, SampleDepth);
 
-        if (TryCutProfileCutterSdfGpuNoReadback(localStart, localEnd, localAxis, localRight, localRadius, localHeight, updateBand, minX, maxX, minY, maxY, minZ, maxZ))
+        changedSampleCount = useMeshCutter
+            ? NativeCutSelectedCutter(
+                localStart,
+                localEnd,
+                localAxis,
+                localRight,
+                localRadius,
+                localHeight,
+                updateBand,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ)
+            : NativeCutProfileCutter(
+                localStart,
+                localEnd,
+                localAxis,
+                localRadius,
+                localHeight,
+                updateBand,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ);
+        if (changedSampleCount <= 0)
         {
-            if (HasAngularCutterProfile)
-            {
-                ShutdownNativeSdfPlugin();
-            }
-            else
-            {
-                NativeCutProfileCutter(localStart, localEnd, localAxis, localRadius, localHeight, updateBand, minX, maxX, minY, maxY, minZ, maxZ);
-            }
-
-            TryCleanupDetachedPartsGpuIfDue();
-            changedSampleCount = 1;
-            return true;
+            return false;
         }
 
-        return false;
+        if (!UploadSdfRegionFromNative(minX, maxX, minY, maxY, minZ, maxZ))
+        {
+            UploadSdfFromNative();
+        }
+
+        ClearGpuVisualCuts();
+        ClearNativeCutDetailDisplay(false);
+        if (UsesChunkedSmoothMesh)
+        {
+            MarkDirtyCells(
+                Mathf.Max(0, minX - 1),
+                Mathf.Min(CellWidth, maxX + 1),
+                Mathf.Max(0, minY - 1),
+                Mathf.Min(CellHeight, maxY + 1),
+                Mathf.Max(0, minZ - 1),
+                Mathf.Min(CellDepth, maxZ + 1),
+                localEnd);
+        }
+        return true;
     }
 
-    private bool RegisterGpuVisualProfileCut(
+    private bool CutNativeCapsuleSdf(
+        Vector3 worldStart,
+        Vector3 worldEnd,
+        float worldRadius,
+        out int changedSampleCount)
+    {
+        changedSampleCount = 0;
+
+        Vector3 localStart = transform.InverseTransformPoint(worldStart);
+        Vector3 localEnd = transform.InverseTransformPoint(worldEnd);
+        float localRadius = WorldDistanceToLocalDistance(worldRadius);
+        float updateBand = voxelSize * 2f;
+        float affectedRadius = localRadius + updateBand;
+
+        Vector3 localMin = Vector3.Min(localStart, localEnd) - Vector3.one * affectedRadius;
+        Vector3 localMax = Vector3.Max(localStart, localEnd) + Vector3.one * affectedRadius;
+        Vector3 detailMin = GetLocalMin() - Vector3.one * updateBand;
+        Vector3 detailMax = -GetLocalMin() + Vector3.one * updateBand;
+        if (!AabbOverlaps(localMin, localMax, detailMin, detailMax))
+        {
+            if (logNativeCutDiagnostics && Application.isPlaying && Time.time >= nextNativeNoOverlapLogTime)
+            {
+                nextNativeNoOverlapLogTime = Time.time + 1f;
+                Debug.Log(
+                    $"Native capsule skipped: sweep bounds outside workpiece. " +
+                    $"start={FormatVector(localStart)}, end={FormatVector(localEnd)}, radius={localRadius:0.####}mm, " +
+                    $"sweepMin={FormatVector(localMin)}, sweepMax={FormatVector(localMax)}, " +
+                    $"workpieceMin={FormatVector(detailMin)}, workpieceMax={FormatVector(detailMax)}.",
+                    this);
+            }
+            return false;
+        }
+
+        Vector3 min = GetLocalMin();
+        int minX = ClampIndex(Mathf.FloorToInt((localMin.x - min.x) / voxelSize) + 1, SampleWidth);
+        int maxX = ClampIndex(Mathf.CeilToInt((localMax.x - min.x) / voxelSize) + 1, SampleWidth);
+        int minY = ClampIndex(Mathf.FloorToInt((localMin.y - min.y) / voxelSize) + 1, SampleHeight);
+        int maxY = ClampIndex(Mathf.CeilToInt((localMax.y - min.y) / voxelSize) + 1, SampleHeight);
+        int minZ = ClampIndex(Mathf.FloorToInt((localMin.z - min.z) / voxelSize) + 1, SampleDepth);
+        int maxZ = ClampIndex(Mathf.CeilToInt((localMax.z - min.z) / voxelSize) + 1, SampleDepth);
+
+        try
+        {
+            changedSampleCount = SdfNativePlugin.sdf_cut_capsule(
+                localStart.x,
+                localStart.y,
+                localStart.z,
+                localEnd.x,
+                localEnd.y,
+                localEnd.z,
+                localRadius,
+                minX,
+                maxX,
+                minY,
+                maxY,
+                minZ,
+                maxZ);
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native capsule cut failed: {ex.Message}", this);
+            sdfNativeReady = false;
+            return false;
+        }
+
+        if (changedSampleCount <= 0)
+        {
+            if (logNativeCutDiagnostics && Application.isPlaying && Time.time >= nextNativeNoChangeLogTime)
+            {
+                nextNativeNoChangeLogTime = Time.time + 1f;
+                Debug.Log(
+                    $"Native capsule changed 0 samples: start={FormatVector(localStart)}, " +
+                    $"end={FormatVector(localEnd)}, radius={localRadius:0.####}mm, voxelSize={voxelSize:0.####}mm, " +
+                    $"sampleBounds=({minX}-{maxX}, {minY}-{maxY}, {minZ}-{maxZ}).",
+                    this);
+            }
+            return false;
+        }
+
+        MarkNativeConnectivityDirty(minX, maxX, minY, maxY, minZ, maxZ);
+
+        if (!UploadSdfRegionFromNative(minX, maxX, minY, maxY, minZ, maxZ))
+        {
+            UploadSdfFromNative();
+        }
+
+        ClearNativeCutDetailDisplay(false);
+        if (UsesChunkedSmoothMesh)
+        {
+            MarkDirtyCells(
+                Mathf.Max(0, minX - 1),
+                Mathf.Min(CellWidth, maxX + 1),
+                Mathf.Max(0, minY - 1),
+                Mathf.Min(CellHeight, maxY + 1),
+                Mathf.Max(0, minZ - 1),
+                Mathf.Min(CellDepth, maxZ + 1),
+                localEnd);
+        }
+
+        return true;
+    }
+
+    private void AddGpuVisualCut(
         Vector3 localStart,
         Vector3 localEnd,
         Vector3 localAxis,
         Vector3 localRight,
         float localRadius,
-        float localHeight,
-        Vector3 operationMin,
-        Vector3 operationMax)
+        float localHeight)
     {
-        if (!UsesGpuSurfaceRendering || !useExpandedDisplayBounds)
+        if (!useGpuVisualCutPreview || !UsesGpuSurfaceRendering || localRadius <= 0f || localHeight <= 0f)
         {
-            return false;
+            return;
         }
 
-        Vector3 displayHalf = DisplaySize * 0.5f;
-        Vector3 displayMin = DisplayCenter - displayHalf;
-        Vector3 displayMax = DisplayCenter + displayHalf;
-        if (!AabbOverlaps(operationMin, operationMax, displayMin, displayMax))
-        {
-            return false;
-        }
-
+        Vector3 axis = localAxis.sqrMagnitude > 0.000001f ? localAxis.normalized : Vector3.up;
+        Vector3 right = ResolveLocalCutterRight(axis, localRight);
         GpuVisualCutOperation operation = new GpuVisualCutOperation
         {
             startRadius = new Vector4(localStart.x, localStart.y, localStart.z, localRadius),
             endHeight = new Vector4(localEnd.x, localEnd.y, localEnd.z, localHeight),
-            axis = new Vector4(localAxis.x, localAxis.y, localAxis.z, 0f),
-            profileMeta = new Vector4(
-                cutterProfileRadiusSampleCount,
-                localRight.x,
-                localRight.y,
-                localRight.z)
+            axis = new Vector4(axis.x, axis.y, axis.z, 0f),
+            profileMeta = new Vector4(cutterProfileRadiusSampleCount, right.x, right.y, right.z),
+            profile0 = PackProfileRadiusSamples(0),
+            profile1 = PackProfileRadiusSamples(4),
+            profile2 = PackProfileRadiusSamples(8),
+            profile3 = PackProfileRadiusSamples(12),
+            profile4 = PackProfileRadiusSamples(16),
+            profile5 = PackProfileRadiusSamples(20),
+            profile6 = PackProfileRadiusSamples(24),
+            profile7 = PackProfileRadiusSamples(28)
         };
-        WriteProfileRadiusSamplesToOperation(ref operation);
 
-        int lastIndex = gpuVisualCutOperations.Count - 1;
-        if (lastIndex >= 0 && TryMergeGpuVisualCut(lastIndex, operation, out bool geometryChanged))
+        if (gpuVisualCutOperations.Count > 0 &&
+            TryMergeGpuVisualCut(gpuVisualCutOperations.Count - 1, operation, out bool geometryChanged))
         {
             if (geometryChanged)
             {
                 gpuVisualCutsDirty = true;
-                MarkGlobalVisualConnectivityDirty();
             }
-            return true;
-        }
 
-        if (gpuVisualCutOperations.Count >= Mathf.Max(16, maxGpuVisualCutOperations))
-        {
-            return false;
+            return;
         }
 
         gpuVisualCutOperations.Add(operation);
+        int maxOperations = Mathf.Max(1, maxGpuVisualCutOperations);
+        while (gpuVisualCutOperations.Count > maxOperations)
+        {
+            gpuVisualCutOperations.RemoveAt(0);
+        }
+
         gpuVisualCutsDirty = true;
-        MarkGlobalVisualConnectivityDirty();
-        return true;
     }
 
-    private void WriteProfileRadiusSamplesToOperation(ref GpuVisualCutOperation operation)
+    private void ClearGpuVisualCuts()
     {
-        operation.profileMeta.x = cutterProfileRadiusSampleCount;
-        operation.profile0 = PackProfileRadiusSamples(0);
-        operation.profile1 = PackProfileRadiusSamples(4);
-        operation.profile2 = PackProfileRadiusSamples(8);
-        operation.profile3 = PackProfileRadiusSamples(12);
-        operation.profile4 = PackProfileRadiusSamples(16);
-        operation.profile5 = PackProfileRadiusSamples(20);
-        operation.profile6 = PackProfileRadiusSamples(24);
-        operation.profile7 = PackProfileRadiusSamples(28);
+        if (gpuVisualCutOperations.Count == 0)
+        {
+            return;
+        }
+
+        gpuVisualCutOperations.Clear();
+        gpuVisualCutsDirty = true;
     }
 
     private Vector4 PackProfileRadiusSamples(int startIndex)
@@ -2258,17 +2838,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             : 0f;
     }
 
-    private void MarkGlobalVisualConnectivityDirty()
-    {
-        if (!removeDetachedParts || !useExpandedDisplayBounds)
-        {
-            return;
-        }
-
-        globalVisualConnectivityDirty = true;
-        lastGlobalVisualCutTime = Application.isPlaying ? Time.time : 0f;
-    }
-
     private static Vector3 ResolveLocalCutterRight(Vector3 localAxis, Vector3 requestedRight)
     {
         Vector3 axis = localAxis.sqrMagnitude > 0.000001f ? localAxis.normalized : Vector3.up;
@@ -2285,6 +2854,50 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         }
 
         return fallback.sqrMagnitude > 0.000001f ? fallback.normalized : Vector3.right;
+    }
+
+    private void GetNativeCutterSweepBounds(
+        Vector3 localStart,
+        Vector3 localEnd,
+        Vector3 localAxis,
+        Vector3 localRight,
+        float padding,
+        out Vector3 boundsMin,
+        out Vector3 boundsMax)
+    {
+        Vector3 axis = localAxis.sqrMagnitude > 0.000001f ? localAxis.normalized : Vector3.up;
+        Vector3 right = ResolveLocalCutterRight(axis, localRight);
+        Vector3 forward = Vector3.Cross(right, axis);
+        if (forward.sqrMagnitude <= 0.000001f)
+        {
+            forward = Vector3.Cross(axis, right);
+        }
+        forward = forward.sqrMagnitude > 0.000001f ? forward.normalized : Vector3.forward;
+
+        boundsMin = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
+        boundsMax = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
+
+        for (int xi = 0; xi < 2; xi++)
+        {
+            float x = xi == 0 ? nativeCutterMeshLocalMin.x : nativeCutterMeshLocalMax.x;
+            for (int yi = 0; yi < 2; yi++)
+            {
+                float y = yi == 0 ? nativeCutterMeshLocalMin.y : nativeCutterMeshLocalMax.y;
+                for (int zi = 0; zi < 2; zi++)
+                {
+                    float z = zi == 0 ? nativeCutterMeshLocalMin.z : nativeCutterMeshLocalMax.z;
+                    Vector3 offset = right * x + axis * y + forward * z;
+                    Vector3 startPoint = localStart + offset;
+                    Vector3 endPoint = localEnd + offset;
+                    boundsMin = Vector3.Min(boundsMin, Vector3.Min(startPoint, endPoint));
+                    boundsMax = Vector3.Max(boundsMax, Vector3.Max(startPoint, endPoint));
+                }
+            }
+        }
+
+        Vector3 expand = Vector3.one * Mathf.Max(0f, padding);
+        boundsMin -= expand;
+        boundsMax += expand;
     }
 
     private bool TryMergeGpuVisualCut(int index, GpuVisualCutOperation next, out bool geometryChanged)
@@ -2378,1078 +2991,375 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         gpuVisualCutsDirty = false;
     }
 
-    private void EnsureGpuDetachedRemovalBuffer()
+    private void RequestNativeCutDetailDisplay(Vector3 localBoundsMin, Vector3 localBoundsMax)
     {
-        int requiredCapacity = Mathf.NextPowerOfTwo(Mathf.Max(1, gpuDetachedRemovalBoxes.Count));
-        if (gpuDetachedRemovalBuffer == null || gpuDetachedRemovalBufferCapacity < requiredCapacity)
+        if (!useNativeCutDetailDisplay || !UsesGpuSurfaceRendering || !sdfNativeReady)
         {
-            if (gpuDetachedRemovalBuffer != null)
-            {
-                gpuDetachedRemovalBuffer.Release();
-            }
-
-            gpuDetachedRemovalBufferCapacity = requiredCapacity;
-            gpuDetachedRemovalBuffer = new ComputeBuffer(gpuDetachedRemovalBufferCapacity, sizeof(float) * 8);
-            gpuDetachedRemovalsDirty = true;
+            ClearNativeCutDetailDisplay(false);
+            return;
         }
 
-        if (!gpuDetachedRemovalsDirty)
+        if (!Application.isPlaying || !isActiveAndEnabled)
         {
             return;
         }
 
-        if (gpuDetachedRemovalBoxes.Count > 0)
-        {
-            gpuDetachedRemovalBuffer.SetData(
-                gpuDetachedRemovalBoxes,
-                0,
-                0,
-                gpuDetachedRemovalBoxes.Count);
-        }
-        else
-        {
-            gpuDetachedRemovalBuffer.SetData(new GpuDetachedRemovalBox[1]);
-        }
-
-        gpuDetachedRemovalsDirty = false;
-    }
-
-    private void EnsureGpuDetachedVoxelMaskBuffer()
-    {
-        if (gpuDetachedVoxelMaskBuffer != null)
+        if (Time.time < nextNativeCutDetailUpdateTime)
         {
             return;
         }
 
-        gpuDetachedVoxelMaskCapacity = 1;
-        gpuDetachedVoxelMaskBuffer = new ComputeBuffer(1, sizeof(float));
-        gpuDetachedVoxelMaskBuffer.SetData(new float[1]);
+        nextNativeCutDetailUpdateTime = Time.time + Mathf.Max(0.01f, nativeCutDetailUpdateInterval);
+        CancelNativeCutDetailRebuild();
+        RemoveNativeCutDetailTilesOverlapping(localBoundsMin, localBoundsMax);
+        nativeCutDetailRequestVersion++;
+        nativeCutDetailCoroutine = StartCoroutine(
+            RebuildNativeCutDetailDisplayCoroutine(
+                localBoundsMin,
+                localBoundsMax,
+                nativeCutDetailRequestVersion));
     }
 
-    private void UploadGpuDetachedVoxelMask(
-        uint[] mask,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        Vector3 gridMin,
-        Vector3 cellStep)
+    private IEnumerator RebuildNativeCutDetailDisplayCoroutine(
+        Vector3 localBoundsMin,
+        Vector3 localBoundsMax,
+        int requestVersion)
     {
-        int requiredCapacity = Mathf.Max(1, mask != null ? mask.Length : 0);
-        if (gpuDetachedVoxelMaskBuffer == null || gpuDetachedVoxelMaskCapacity < requiredCapacity)
+        Vector3 stockMin = GetLocalMin();
+        Vector3 stockMax = -stockMin;
+        float padding = Mathf.Max(0f, nativeCutDetailPaddingMm);
+        Vector3 min = Vector3.Max(localBoundsMin - Vector3.one * padding, stockMin);
+        Vector3 max = Vector3.Min(localBoundsMax + Vector3.one * padding, stockMax);
+        Vector3 size = max - min;
+        float requestedStep = Mathf.Max(0.001f, nativeCutDetailVoxelSize);
+        if (size.x <= requestedStep || size.y <= requestedStep || size.z <= requestedStep)
         {
-            if (gpuDetachedVoxelMaskBuffer != null)
-            {
-                gpuDetachedVoxelMaskBuffer.Release();
-            }
-
-            gpuDetachedVoxelMaskCapacity = requiredCapacity;
-            gpuDetachedVoxelMaskBuffer = new ComputeBuffer(requiredCapacity, sizeof(float));
+            nativeCutDetailCoroutine = null;
+            yield break;
         }
 
-        if (mask != null && mask.Length > 0)
+        int cellX = Mathf.Max(1, Mathf.CeilToInt(size.x / requestedStep));
+        int cellY = Mathf.Max(1, Mathf.CeilToInt(size.y / requestedStep));
+        int cellZ = Mathf.Max(1, Mathf.CeilToInt(size.z / requestedStep));
+        long sampleCount = (long)(cellX + 1) * (cellY + 1) * (cellZ + 1);
+        int sampleBudget = Mathf.Max(4096, maxNativeCutDetailSamples);
+        float step = requestedStep;
+        if (sampleCount > sampleBudget)
         {
-            int removedCellCount = 0;
-            for (int i = 0; i < mask.Length; i++)
+            float relaxation = Mathf.Pow(sampleCount / (float)sampleBudget, 1f / 3f);
+            step = requestedStep * relaxation;
+            cellX = Mathf.Max(1, Mathf.CeilToInt(size.x / step));
+            cellY = Mathf.Max(1, Mathf.CeilToInt(size.y / step));
+            cellZ = Mathf.Max(1, Mathf.CeilToInt(size.z / step));
+            sampleCount = (long)(cellX + 1) * (cellY + 1) * (cellZ + 1);
+        }
+
+        if (sampleCount <= 0 || sampleCount > int.MaxValue)
+        {
+            nativeCutDetailCoroutine = null;
+            yield break;
+        }
+
+        int countX = cellX + 1;
+        int countY = cellY + 1;
+        int countZ = cellZ + 1;
+        int totalSamples = (int)sampleCount;
+        if (nativeCutDetailValues == null || nativeCutDetailValues.Length < totalSamples)
+        {
+            nativeCutDetailValues = new float[totalSamples];
+        }
+
+        int batchCapacity = Mathf.Min(Mathf.Max(1024, nativeCutDetailBatchSize), totalSamples);
+        if (nativeCutDetailBatchPoints == null || nativeCutDetailBatchPoints.Length < batchCapacity * 3)
+        {
+            nativeCutDetailBatchPoints = new float[batchCapacity * 3];
+        }
+
+        if (nativeCutDetailBatchValues == null || nativeCutDetailBatchValues.Length < batchCapacity)
+        {
+            nativeCutDetailBatchValues = new float[batchCapacity];
+        }
+
+        int globalIndex = 0;
+        int batchCount = 0;
+        for (int z = 0; z < countZ; z++)
+        {
+            float pz = min.z + z * step;
+            for (int y = 0; y < countY; y++)
             {
-                if (mask[i] != 0)
+                float py = min.y + y * step;
+                for (int x = 0; x < countX; x++)
                 {
-                    removedCellCount++;
-                }
-            }
+                    float px = min.x + x * step;
+                    int batchOffset = batchCount * 3;
+                    nativeCutDetailBatchPoints[batchOffset + 0] = px;
+                    nativeCutDetailBatchPoints[batchOffset + 1] = py;
+                    nativeCutDetailBatchPoints[batchOffset + 2] = pz;
+                    batchCount++;
 
-            // An empty mask must be disabled completely. Leaving a populated
-            // grid of negative placeholder values active can still affect the
-            // max() CSG field and its numerical normals.
-            if (removedCellCount == 0)
-            {
-                gpuDetachedVoxelMaskBuffer.SetData(new float[1]);
-                gpuDetachedVoxelMaskSize = Vector3Int.zero;
-                gpuDetachedVoxelMaskMin = Vector3.zero;
-                gpuDetachedVoxelMaskStep = Vector3.one;
-                gpuDetachedVoxelMaskAirValue = 0f;
-                return;
-            }
-
-            // Convert the binary connectivity result into a conservative
-            // signed distance field. A raw +/- binary value has a discontinuity
-            // on its negative side; that discontinuity was leaking into the
-            // ray-marched normal and produced the visible "frosted" speckles.
-            // A 26-neighbour breadth-first distance is a Chebyshev distance,
-            // so using the smallest cell step never over-estimates the true
-            // Euclidean distance and remains safe for sphere tracing.
-            int[] distance = new int[mask.Length];
-            int[] queue = new int[mask.Length];
-            for (int i = 0; i < distance.Length; i++)
-            {
-                distance[i] = -1;
-            }
-
-            int queueHead = 0;
-            int queueTail = 0;
-            int layerStride = cellsX * cellsY;
-            for (int z = 0; z < cellsZ; z++)
-            {
-                for (int y = 0; y < cellsY; y++)
-                {
-                    for (int x = 0; x < cellsX; x++)
+                    if (batchCount >= batchCapacity)
                     {
-                        int index = x + cellsX * y + layerStride * z;
-                        bool removed = mask[index] != 0;
-                        bool boundary =
-                            (x > 0 && (mask[index - 1] != 0) != removed) ||
-                            (x + 1 < cellsX && (mask[index + 1] != 0) != removed) ||
-                            (y > 0 && (mask[index - cellsX] != 0) != removed) ||
-                            (y + 1 < cellsY && (mask[index + cellsX] != 0) != removed) ||
-                            (z > 0 && (mask[index - layerStride] != 0) != removed) ||
-                            (z + 1 < cellsZ && (mask[index + layerStride] != 0) != removed) ||
-                            (removed && (x == 0 || x + 1 == cellsX ||
-                                         y == 0 || y + 1 == cellsY ||
-                                         z == 0 || z + 1 == cellsZ));
-
-                        if (boundary)
+                        if (!SampleNativeCutDetailBatch(globalIndex, batchCount))
                         {
-                            distance[index] = 0;
-                            queue[queueTail++] = index;
-                        }
-                    }
-                }
-            }
-
-            while (queueHead < queueTail)
-            {
-                int index = queue[queueHead++];
-                int z = index / layerStride;
-                int remainder = index - z * layerStride;
-                int y = remainder / cellsX;
-                int x = remainder - y * cellsX;
-                int nextDistance = distance[index] + 1;
-
-                for (int dz = -1; dz <= 1; dz++)
-                {
-                    int nz = z + dz;
-                    if (nz < 0 || nz >= cellsZ)
-                    {
-                        continue;
-                    }
-
-                    for (int dy = -1; dy <= 1; dy++)
-                    {
-                        int ny = y + dy;
-                        if (ny < 0 || ny >= cellsY)
-                        {
-                            continue;
+                            nativeCutDetailCoroutine = null;
+                            yield break;
                         }
 
-                        for (int dx = -1; dx <= 1; dx++)
+                        globalIndex += batchCount;
+                        batchCount = 0;
+                        if (requestVersion != nativeCutDetailRequestVersion)
                         {
-                            if (dx == 0 && dy == 0 && dz == 0)
-                            {
-                                continue;
-                            }
-
-                            int nx = x + dx;
-                            if (nx < 0 || nx >= cellsX)
-                            {
-                                continue;
-                            }
-
-                            int neighbor = nx + cellsX * ny + layerStride * nz;
-                            if (distance[neighbor] >= 0)
-                            {
-                                continue;
-                            }
-
-                            distance[neighbor] = nextDistance;
-                            queue[queueTail++] = neighbor;
-                        }
-                    }
-                }
-            }
-
-            float distanceStep = Mathf.Min(
-                cellStep.x,
-                Mathf.Min(cellStep.y, cellStep.z));
-            float airValue = distanceStep * 0.5f;
-            float[] continuousMask = new float[mask.Length];
-            for (int i = 0; i < mask.Length; i++)
-            {
-                float signedDistance = (Mathf.Max(0, distance[i]) + 0.5f) * distanceStep;
-                continuousMask[i] = mask[i] != 0 ? signedDistance : -signedDistance;
-            }
-            gpuDetachedVoxelMaskBuffer.SetData(continuousMask);
-            gpuDetachedVoxelMaskSize = new Vector3Int(cellsX, cellsY, cellsZ);
-            gpuDetachedVoxelMaskMin = gridMin;
-            gpuDetachedVoxelMaskStep = new Vector3(
-                Mathf.Max(voxelSize * 0.000001f, cellStep.x),
-                Mathf.Max(voxelSize * 0.000001f, cellStep.y),
-                Mathf.Max(voxelSize * 0.000001f, cellStep.z));
-            gpuDetachedVoxelMaskAirValue = airValue;
-        }
-        else
-        {
-            gpuDetachedVoxelMaskBuffer.SetData(new float[1]);
-            gpuDetachedVoxelMaskSize = Vector3Int.zero;
-            gpuDetachedVoxelMaskMin = Vector3.zero;
-            gpuDetachedVoxelMaskStep = Vector3.one;
-            gpuDetachedVoxelMaskAirValue = 0f;
-        }
-    }
-
-    private void TryCleanupGlobalVisualIslandsIfDue()
-    {
-        if (!globalVisualConnectivityDirty || !removeDetachedParts ||
-            !UsesGpuSurfaceRendering || !useExpandedDisplayBounds)
-        {
-            return;
-        }
-
-        if (Application.isPlaying &&
-            Time.time < lastGlobalVisualCutTime + Mathf.Max(0.05f, detachedCleanupInterval))
-        {
-            return;
-        }
-
-        globalVisualConnectivityDirty = false;
-        CleanupGlobalVisualIslands();
-    }
-
-    private void CleanupGlobalVisualIslands()
-    {
-        if (gpuVisualCutOperations.Count == 0)
-        {
-            return;
-        }
-
-        Vector3 displayHalf = DisplaySize * 0.5f;
-        Vector3 displayMin = DisplayCenter - displayHalf;
-        Vector3 displayMax = DisplayCenter + displayHalf;
-        Vector3 cutMinAll = new Vector3(float.PositiveInfinity, float.PositiveInfinity, float.PositiveInfinity);
-        Vector3 cutMaxAll = new Vector3(float.NegativeInfinity, float.NegativeInfinity, float.NegativeInfinity);
-        float minimumFeature = float.PositiveInfinity;
-
-        for (int i = 0; i < gpuVisualCutOperations.Count; i++)
-        {
-            GetGpuVisualCutBounds(gpuVisualCutOperations[i], out Vector3 cutMin, out Vector3 cutMax);
-            cutMinAll = Vector3.Min(cutMinAll, cutMin);
-            cutMaxAll = Vector3.Max(cutMaxAll, cutMax);
-            minimumFeature = Mathf.Min(
-                minimumFeature,
-                Mathf.Min(
-                    Mathf.Max(voxelSize, gpuVisualCutOperations[i].startRadius.w),
-                    Mathf.Max(voxelSize, gpuVisualCutOperations[i].endHeight.w)));
-        }
-
-        if (float.IsInfinity(minimumFeature))
-        {
-            return;
-        }
-
-        float targetCellSize = Mathf.Max(
-            voxelSize * 2f,
-            minimumFeature * Mathf.Clamp(globalConnectivityFeatureScale, 0.1f, 1f));
-        float padding = Mathf.Max(minimumFeature, targetCellSize * 2f);
-
-        // A detached piece often extends above or below the local cut window. If
-        // vertical connectivity is evaluated only in that window, touching the
-        // window edge looks like support and the island survives. Keep X/Z
-        // focused around the cut footprint for resolution, but analyze the full
-        // display height down to the real support boundary.
-        Vector3 analysisMin = new Vector3(
-            Mathf.Max(displayMin.x, cutMinAll.x - padding),
-            displayMin.y,
-            Mathf.Max(displayMin.z, cutMinAll.z - padding));
-        Vector3 analysisMax = new Vector3(
-            Mathf.Min(displayMax.x, cutMaxAll.x + padding),
-            displayMax.y,
-            Mathf.Min(displayMax.z, cutMaxAll.z + padding));
-        Vector3 analysisSize = analysisMax - analysisMin;
-        if (analysisSize.x <= 0f || analysisSize.y <= 0f || analysisSize.z <= 0f)
-        {
-            return;
-        }
-
-        targetCellSize = Mathf.Max(
-            targetCellSize,
-            Mathf.Max(analysisSize.x, Mathf.Max(analysisSize.y, analysisSize.z)) / 1024f);
-        int cellsX = Mathf.Max(1, Mathf.CeilToInt(analysisSize.x / targetCellSize));
-        int cellsY = Mathf.Max(1, Mathf.CeilToInt(analysisSize.y / targetCellSize));
-        int cellsZ = Mathf.Max(1, Mathf.CeilToInt(analysisSize.z / targetCellSize));
-        long totalCells = (long)cellsX * cellsY * cellsZ;
-        int cellBudget = Mathf.Max(10000, maxGlobalConnectivityCells);
-
-        while (totalCells > cellBudget)
-        {
-            float relaxation = Mathf.Max(1.05f, Mathf.Pow(totalCells / (float)cellBudget, 1f / 3f));
-            targetCellSize *= relaxation;
-            cellsX = Mathf.Max(1, Mathf.CeilToInt(analysisSize.x / targetCellSize));
-            cellsY = Mathf.Max(1, Mathf.CeilToInt(analysisSize.y / targetCellSize));
-            cellsZ = Mathf.Max(1, Mathf.CeilToInt(analysisSize.z / targetCellSize));
-            totalCells = (long)cellsX * cellsY * cellsZ;
-        }
-
-        if (totalCells <= 1 || totalCells > int.MaxValue)
-        {
-            return;
-        }
-
-        Vector3 cellStep = new Vector3(
-            analysisSize.x / cellsX,
-            analysisSize.y / cellsY,
-            analysisSize.z / cellsZ);
-        int cellCount = (int)totalCells;
-        byte[] solid = new byte[cellCount];
-        uint[] removalMask = new uint[cellCount];
-        for (int i = 0; i < cellCount; i++)
-        {
-            solid[i] = 1;
-        }
-
-        if (gpuDetachedRemovalBoxes.Count > 0)
-        {
-            gpuDetachedRemovalBoxes.Clear();
-            gpuDetachedRemovalsDirty = true;
-        }
-
-        // Connectivity must never enlarge the cutter volume: doing so can
-        // sever a real, narrow bridge and turn valid material into a false
-        // island. The grid resolution is derived from the current cutter
-        // feature size, so center-inside classification is sufficient.
-        const float cutTolerance = 0f;
-        for (int operationIndex = 0; operationIndex < gpuVisualCutOperations.Count; operationIndex++)
-        {
-            RasterizeVisualCut(
-                solid,
-                cellsX,
-                cellsY,
-                cellsZ,
-                analysisMin,
-                cellStep,
-                gpuVisualCutOperations[operationIndex],
-                cutTolerance);
-        }
-
-        int[] labels = new int[cellCount];
-        Queue<int> queue = new Queue<int>(Mathf.Min(cellCount, 65536));
-        List<GlobalConnectivityComponent> components = new List<GlobalConnectivityComponent>(16);
-        int nextLabel = 0;
-
-        for (int index = 0; index < cellCount; index++)
-        {
-            if (solid[index] == 0 || labels[index] != 0)
-            {
-                continue;
-            }
-
-            nextLabel++;
-            GlobalConnectivityComponent component = new GlobalConnectivityComponent
-            {
-                label = nextLabel,
-                minX = cellsX,
-                minY = cellsY,
-                minZ = cellsZ,
-                maxX = -1,
-                maxY = -1,
-                maxZ = -1
-            };
-            labels[index] = nextLabel;
-            queue.Enqueue(index);
-
-            while (queue.Count > 0)
-            {
-                int current = queue.Dequeue();
-                DecodeGlobalCellIndex(current, cellsX, cellsY, out int x, out int y, out int z);
-                component.count++;
-                component.minX = Mathf.Min(component.minX, x);
-                component.minY = Mathf.Min(component.minY, y);
-                component.minZ = Mathf.Min(component.minZ, z);
-                component.maxX = Mathf.Max(component.maxX, x);
-                component.maxY = Mathf.Max(component.maxY, y);
-                component.maxZ = Mathf.Max(component.maxZ, z);
-                component.touchesSupportedBoundary |= IsGlobalSupportBoundary(
-                    x, y, z,
-                    cellsX, cellsY, cellsZ,
-                    analysisMin, analysisMax,
-                    displayMin, displayMax,
-                    cellStep);
-
-                TryVisitGlobalNeighbor(x - 1, y, z, cellsX, cellsY, cellsZ, solid, labels, nextLabel, queue);
-                TryVisitGlobalNeighbor(x + 1, y, z, cellsX, cellsY, cellsZ, solid, labels, nextLabel, queue);
-                TryVisitGlobalNeighbor(x, y - 1, z, cellsX, cellsY, cellsZ, solid, labels, nextLabel, queue);
-                TryVisitGlobalNeighbor(x, y + 1, z, cellsX, cellsY, cellsZ, solid, labels, nextLabel, queue);
-                TryVisitGlobalNeighbor(x, y, z - 1, cellsX, cellsY, cellsZ, solid, labels, nextLabel, queue);
-                TryVisitGlobalNeighbor(x, y, z + 1, cellsX, cellsY, cellsZ, solid, labels, nextLabel, queue);
-            }
-
-            components.Add(component);
-        }
-
-        // Do not remove components merely because they look enclosed in a
-        // horizontal slice. A valid part can still be connected to material
-        // below that slice. Only the full 3D connectivity result below is
-        // allowed to mark removal voxels.
-        int machiningRemovedCells = 0;
-
-        bool hasSupportedComponent = false;
-        int largestComponentIndex = 0;
-        for (int i = 0; i < components.Count; i++)
-        {
-            hasSupportedComponent |= components[i].touchesSupportedBoundary;
-            if (components[i].count > components[largestComponentIndex].count)
-            {
-                largestComponentIndex = i;
-            }
-        }
-
-        int removedComponents = 0;
-        bool[] removeComponentLabels = new bool[nextLabel + 1];
-        if (components.Count > 1)
-        {
-            for (int i = 0; i < components.Count; i++)
-            {
-                bool keep = hasSupportedComponent
-                    ? components[i].touchesSupportedBoundary
-                    : i == largestComponentIndex;
-                if (keep)
-                {
-                    continue;
-                }
-
-                removeComponentLabels[components[i].label] = true;
-                removedComponents++;
-            }
-        }
-
-        int detachedRemovedCells = 0;
-        if (removedComponents > 0)
-        {
-            for (int index = 0; index < labels.Length; index++)
-            {
-                int label = labels[index];
-                if (label > 0 && removeComponentLabels[label] && removalMask[index] == 0)
-                {
-                    removalMask[index] = 1;
-                    detachedRemovedCells++;
-                }
-            }
-        }
-
-        UploadGpuDetachedVoxelMask(
-            removalMask,
-            cellsX,
-            cellsY,
-            cellsZ,
-            analysisMin,
-            cellStep);
-
-        Debug.Log(
-            $"GLOBAL_ISLAND_MASK machiningCells={machiningRemovedCells}, " +
-            $"detachedCells={detachedRemovedCells}, components={removedComponents}, " +
-            $"grid={cellsX}x{cellsY}x{cellsZ}, cell={cellStep}",
-            this);
-    }
-
-    private int CleanupGlobalMachiningIslands(
-        byte[] solid,
-        uint[] removalMask,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        Vector3 analysisMin,
-        Vector3 analysisMax,
-        Vector3 displayMin,
-        Vector3 displayMax,
-        Vector3 cellStep)
-    {
-        int sliceCellCount = cellsX * cellsZ;
-        int[] sliceLabels = new int[sliceCellCount];
-        Queue<int> queue = new Queue<int>(Mathf.Min(sliceCellCount, 65536));
-        int removedCells = 0;
-
-        for (int y = 0; y < cellsY; y++)
-        {
-            System.Array.Clear(sliceLabels, 0, sliceLabels.Length);
-            List<GlobalConnectivityComponent> sliceComponents = new List<GlobalConnectivityComponent>(8);
-            int nextLabel = 0;
-
-            for (int z = 0; z < cellsZ; z++)
-            {
-                for (int x = 0; x < cellsX; x++)
-                {
-                    int sliceIndex = x + cellsX * z;
-                    int globalIndex = GetGlobalCellIndex(x, y, z, cellsX, cellsY);
-                    if (solid[globalIndex] == 0 || sliceLabels[sliceIndex] != 0)
-                    {
-                        continue;
-                    }
-
-                    nextLabel++;
-                    GlobalConnectivityComponent component = new GlobalConnectivityComponent
-                    {
-                        label = nextLabel,
-                        minX = cellsX,
-                        minZ = cellsZ,
-                        maxX = -1,
-                        maxZ = -1
-                    };
-                    sliceLabels[sliceIndex] = nextLabel;
-                    queue.Enqueue(sliceIndex);
-
-                    while (queue.Count > 0)
-                    {
-                        int current = queue.Dequeue();
-                        int currentZ = current / cellsX;
-                        int currentX = current - currentZ * cellsX;
-                        component.count++;
-                        component.minX = Mathf.Min(component.minX, currentX);
-                        component.minZ = Mathf.Min(component.minZ, currentZ);
-                        component.maxX = Mathf.Max(component.maxX, currentX);
-                        component.maxZ = Mathf.Max(component.maxZ, currentZ);
-                        component.touchesSupportedBoundary |=
-                            (currentX == 0 && analysisMin.x > displayMin.x + cellStep.x * 0.25f) ||
-                            (currentX == cellsX - 1 && analysisMax.x < displayMax.x - cellStep.x * 0.25f) ||
-                            (currentZ == 0 && analysisMin.z > displayMin.z + cellStep.z * 0.25f) ||
-                            (currentZ == cellsZ - 1 && analysisMax.z < displayMax.z - cellStep.z * 0.25f);
-
-                        TryVisitGlobalSliceNeighbor(
-                            currentX - 1, currentZ, y,
-                            cellsX, cellsY, cellsZ,
-                            solid, sliceLabels, nextLabel, queue);
-                        TryVisitGlobalSliceNeighbor(
-                            currentX + 1, currentZ, y,
-                            cellsX, cellsY, cellsZ,
-                            solid, sliceLabels, nextLabel, queue);
-                        TryVisitGlobalSliceNeighbor(
-                            currentX, currentZ - 1, y,
-                            cellsX, cellsY, cellsZ,
-                            solid, sliceLabels, nextLabel, queue);
-                        TryVisitGlobalSliceNeighbor(
-                            currentX, currentZ + 1, y,
-                            cellsX, cellsY, cellsZ,
-                            solid, sliceLabels, nextLabel, queue);
-                    }
-
-                    sliceComponents.Add(component);
-                }
-            }
-
-            if (sliceComponents.Count <= 1)
-            {
-                continue;
-            }
-
-            bool hasSupportedComponent = false;
-            int largestComponentIndex = 0;
-            for (int i = 0; i < sliceComponents.Count; i++)
-            {
-                hasSupportedComponent |= sliceComponents[i].touchesSupportedBoundary;
-                if (sliceComponents[i].count > sliceComponents[largestComponentIndex].count)
-                {
-                    largestComponentIndex = i;
-                }
-            }
-
-            for (int i = 0; i < sliceComponents.Count; i++)
-            {
-                bool keep = hasSupportedComponent
-                    ? sliceComponents[i].touchesSupportedBoundary
-                    : i == largestComponentIndex;
-                if (keep)
-                {
-                    continue;
-                }
-
-                int labelToRemove = sliceComponents[i].label;
-                int firstRemovedY = Mathf.Max(0, y - 1);
-                for (int z = 0; z < cellsZ; z++)
-                {
-                    for (int x = 0; x < cellsX; x++)
-                    {
-                        if (sliceLabels[x + cellsX * z] != labelToRemove)
-                        {
-                            continue;
+                            yield break;
                         }
 
-                        for (int removeY = firstRemovedY; removeY < cellsY; removeY++)
-                        {
-                            int globalIndex = GetGlobalCellIndex(x, removeY, z, cellsX, cellsY);
-                            solid[globalIndex] = 0;
-                            if (removalMask[globalIndex] == 0)
-                            {
-                                removalMask[globalIndex] = 1;
-                                removedCells++;
-                            }
-                        }
+                        yield return null;
                     }
                 }
             }
         }
 
-        return removedCells;
-    }
-
-    private void ExpandGlobalRemovalBounds(ref Vector3 boxMin, ref Vector3 boxMax, Vector3 cellStep)
-    {
-        Vector3 minimumPadding = Vector3.one * (voxelSize * 2f);
-        Vector3 padding = Vector3.Max(cellStep * 1.5f, minimumPadding);
-        boxMin -= padding;
-        boxMax += padding;
-    }
-
-    private void ExpandGlobalMachiningRemovalBounds(ref Vector3 boxMin, ref Vector3 boxMax, Vector3 cellStep)
-    {
-        float minimumPadding = voxelSize * 2f;
-        float paddingX = Mathf.Max(cellStep.x * 1.5f, minimumPadding);
-        float paddingZ = Mathf.Max(cellStep.z * 1.5f, minimumPadding);
-        float lowerPadding = Mathf.Max(cellStep.y * 0.1f, minimumPadding);
-        float upperPadding = Mathf.Max(cellStep.y * 1.5f, minimumPadding);
-        boxMin -= new Vector3(paddingX, lowerPadding, paddingZ);
-        boxMax += new Vector3(paddingX, upperPadding, paddingZ);
-    }
-
-    private static void TryVisitGlobalSliceNeighbor(
-        int x,
-        int z,
-        int y,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        byte[] solid,
-        int[] labels,
-        int label,
-        Queue<int> queue)
-    {
-        if (x < 0 || x >= cellsX || z < 0 || z >= cellsZ || y < 0 || y >= cellsY)
+        if (batchCount > 0 && !SampleNativeCutDetailBatch(globalIndex, batchCount))
         {
-            return;
+            nativeCutDetailCoroutine = null;
+            yield break;
         }
 
-        int sliceIndex = x + cellsX * z;
-        int globalIndex = GetGlobalCellIndex(x, y, z, cellsX, cellsY);
-        if (solid[globalIndex] == 0 || labels[sliceIndex] != 0)
+        if (requestVersion != nativeCutDetailRequestVersion)
         {
-            return;
+            yield break;
         }
 
-        labels[sliceIndex] = label;
-        queue.Enqueue(sliceIndex);
+        UploadNativeCutDetailDisplay(min, step, new Vector3Int(countX, countY, countZ), totalSamples);
+        nativeCutDetailCoroutine = null;
     }
 
-    private void RasterizeVisualCut(
-        byte[] solid,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        Vector3 analysisMin,
-        Vector3 cellStep,
-        GpuVisualCutOperation operation,
-        float tolerance)
+    private bool SampleNativeCutDetailBatch(int destinationStart, int count)
     {
-        GetGpuVisualCutBounds(operation, out Vector3 cutMin, out Vector3 cutMax);
-        GetGlobalRasterRange(cutMin, cutMax, analysisMin, cellStep, cellsX, cellsY, cellsZ,
-            out int minX, out int maxX, out int minY, out int maxY, out int minZ, out int maxZ);
-
-        for (int z = minZ; z <= maxZ; z++)
+        try
         {
-            for (int y = minY; y <= maxY; y++)
+            int sampled = SdfNativePlugin.sdf_sample_cut_points(
+                nativeCutDetailBatchPoints,
+                nativeCutDetailBatchValues,
+                count);
+            if (sampled != count)
             {
-                for (int x = minX; x <= maxX; x++)
-                {
-                    Vector3 point = analysisMin + Vector3.Scale(
-                        new Vector3(x + 0.5f, y + 0.5f, z + 0.5f),
-                        cellStep);
-                    if (GpuVisualProfileDifferenceCpu(point, operation) >= -tolerance)
-                    {
-                        solid[GetGlobalCellIndex(x, y, z, cellsX, cellsY)] = 0;
-                    }
-                }
-            }
-        }
-    }
-
-    private static void RasterizeRemovalBox(
-        byte[] solid,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        Vector3 analysisMin,
-        Vector3 cellStep,
-        Vector3 boxMin,
-        Vector3 boxMax)
-    {
-        GetGlobalRasterRange(boxMin, boxMax, analysisMin, cellStep, cellsX, cellsY, cellsZ,
-            out int minX, out int maxX, out int minY, out int maxY, out int minZ, out int maxZ);
-        for (int z = minZ; z <= maxZ; z++)
-        {
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int x = minX; x <= maxX; x++)
-                {
-                    Vector3 point = analysisMin + Vector3.Scale(
-                        new Vector3(x + 0.5f, y + 0.5f, z + 0.5f),
-                        cellStep);
-                    if (point.x >= boxMin.x && point.x <= boxMax.x &&
-                        point.y >= boxMin.y && point.y <= boxMax.y &&
-                        point.z >= boxMin.z && point.z <= boxMax.z)
-                    {
-                        solid[GetGlobalCellIndex(x, y, z, cellsX, cellsY)] = 0;
-                    }
-                }
-            }
-        }
-    }
-
-    private static void GetGlobalRasterRange(
-        Vector3 boundsMin,
-        Vector3 boundsMax,
-        Vector3 gridMin,
-        Vector3 cellStep,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        out int minX,
-        out int maxX,
-        out int minY,
-        out int maxY,
-        out int minZ,
-        out int maxZ)
-    {
-        minX = Mathf.Clamp(Mathf.FloorToInt((boundsMin.x - gridMin.x) / cellStep.x), 0, cellsX - 1);
-        maxX = Mathf.Clamp(Mathf.FloorToInt((boundsMax.x - gridMin.x) / cellStep.x), 0, cellsX - 1);
-        minY = Mathf.Clamp(Mathf.FloorToInt((boundsMin.y - gridMin.y) / cellStep.y), 0, cellsY - 1);
-        maxY = Mathf.Clamp(Mathf.FloorToInt((boundsMax.y - gridMin.y) / cellStep.y), 0, cellsY - 1);
-        minZ = Mathf.Clamp(Mathf.FloorToInt((boundsMin.z - gridMin.z) / cellStep.z), 0, cellsZ - 1);
-        maxZ = Mathf.Clamp(Mathf.FloorToInt((boundsMax.z - gridMin.z) / cellStep.z), 0, cellsZ - 1);
-    }
-
-    private static int GetGlobalCellIndex(int x, int y, int z, int cellsX, int cellsY)
-    {
-        return x + cellsX * (y + cellsY * z);
-    }
-
-    private static void DecodeGlobalCellIndex(int index, int cellsX, int cellsY, out int x, out int y, out int z)
-    {
-        int layerSize = cellsX * cellsY;
-        z = index / layerSize;
-        int layerOffset = index - z * layerSize;
-        y = layerOffset / cellsX;
-        x = layerOffset - y * cellsX;
-    }
-
-    private static void TryVisitGlobalNeighbor(
-        int x,
-        int y,
-        int z,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        byte[] solid,
-        int[] labels,
-        int label,
-        Queue<int> queue)
-    {
-        if (x < 0 || x >= cellsX || y < 0 || y >= cellsY || z < 0 || z >= cellsZ)
-        {
-            return;
-        }
-
-        int index = GetGlobalCellIndex(x, y, z, cellsX, cellsY);
-        if (solid[index] == 0 || labels[index] != 0)
-        {
-            return;
-        }
-
-        labels[index] = label;
-        queue.Enqueue(index);
-    }
-
-    private static bool IsGlobalSupportBoundary(
-        int x,
-        int y,
-        int z,
-        int cellsX,
-        int cellsY,
-        int cellsZ,
-        Vector3 analysisMin,
-        Vector3 analysisMax,
-        Vector3 displayMin,
-        Vector3 displayMax,
-        Vector3 cellStep)
-    {
-        float epsilonX = cellStep.x * 0.25f;
-        float epsilonY = cellStep.y * 0.25f;
-        float epsilonZ = cellStep.z * 0.25f;
-        return (x == 0 && analysisMin.x > displayMin.x + epsilonX) ||
-               (x == cellsX - 1 && analysisMax.x < displayMax.x - epsilonX) ||
-               y == 0 ||
-               (y == cellsY - 1 && analysisMax.y < displayMax.y - epsilonY) ||
-               (z == 0 && analysisMin.z > displayMin.z + epsilonZ) ||
-               (z == cellsZ - 1 && analysisMax.z < displayMax.z - epsilonZ);
-    }
-
-    private bool TryAddGpuDetachedRemovalBox(Vector3 boxMin, Vector3 boxMax)
-    {
-        Vector3 size = boxMax - boxMin;
-        if (size.x <= 0f || size.y <= 0f || size.z <= 0f)
-        {
-            return false;
-        }
-
-        Vector3 center = (boxMin + boxMax) * 0.5f;
-        for (int i = 0; i < gpuDetachedRemovalBoxes.Count; i++)
-        {
-            GpuDetachedRemovalBox existing = gpuDetachedRemovalBoxes[i];
-            Vector3 existingCenter = new Vector3(existing.center.x, existing.center.y, existing.center.z);
-            Vector3 existingSize = new Vector3(existing.size.x, existing.size.y, existing.size.z);
-            Vector3 existingMin = existingCenter - existingSize * 0.5f;
-            Vector3 existingMax = existingCenter + existingSize * 0.5f;
-            if (boxMin.x >= existingMin.x && boxMax.x <= existingMax.x &&
-                boxMin.y >= existingMin.y && boxMax.y <= existingMax.y &&
-                boxMin.z >= existingMin.z && boxMax.z <= existingMax.z)
-            {
+                ClearNativeCutDetailDisplay(false);
                 return false;
             }
-        }
 
-        if (gpuDetachedRemovalBoxes.Count >= Mathf.Max(1, maxGpuDetachedRemovalBoxes))
-        {
-            Debug.LogWarning("Global detached removal box budget reached; increase maxGpuDetachedRemovalBoxes.", this);
-            return false;
-        }
-
-        gpuDetachedRemovalBoxes.Add(new GpuDetachedRemovalBox
-        {
-            center = new Vector4(center.x, center.y, center.z, 0f),
-            size = new Vector4(size.x, size.y, size.z, 0f)
-        });
-        return true;
-    }
-
-    private static void GetGpuVisualCutBounds(GpuVisualCutOperation operation, out Vector3 boundsMin, out Vector3 boundsMax)
-    {
-        Vector3 start = new Vector3(operation.startRadius.x, operation.startRadius.y, operation.startRadius.z);
-        Vector3 end = new Vector3(operation.endHeight.x, operation.endHeight.y, operation.endHeight.z);
-        Vector3 axis = new Vector3(operation.axis.x, operation.axis.y, operation.axis.z);
-        axis = axis.sqrMagnitude < 0.000001f ? Vector3.up : axis.normalized;
-        float radius = Mathf.Max(0f, operation.startRadius.w);
-        float height = Mathf.Max(0f, operation.endHeight.w);
-        Vector3 startTop = start + axis * height;
-        Vector3 endTop = end + axis * height;
-        boundsMin = Vector3.Min(Vector3.Min(start, end), Vector3.Min(startTop, endTop)) - Vector3.one * radius;
-        boundsMax = Vector3.Max(Vector3.Max(start, end), Vector3.Max(startTop, endTop)) + Vector3.one * radius;
-    }
-
-    private float GpuVisualProfileDifferenceCpu(Vector3 samplePoint, GpuVisualCutOperation operation)
-    {
-        Vector3 start = new Vector3(operation.startRadius.x, operation.startRadius.y, operation.startRadius.z);
-        Vector3 end = new Vector3(operation.endHeight.x, operation.endHeight.y, operation.endHeight.z);
-        Vector3 axis = new Vector3(operation.axis.x, operation.axis.y, operation.axis.z);
-        axis = axis.sqrMagnitude < 0.000001f ? Vector3.up : axis.normalized;
-        float radius = Mathf.Max(0f, operation.startRadius.w);
-        float cutterHeight = Mathf.Max(voxelSize, operation.endHeight.w);
-        Vector3 motion = end - start;
-        Vector3 radialMotion = motion - axis * Vector3.Dot(motion, axis);
-        Vector3 toSampleFromStart = samplePoint - start;
-        Vector3 radialFromStart = toSampleFromStart - axis * Vector3.Dot(toSampleFromStart, axis);
-        float epsilon = Mathf.Max(radius, cutterHeight) * 0.000001f;
-        float epsilonSqr = epsilon * epsilon;
-        float radialT = radialMotion.sqrMagnitude > epsilonSqr
-            ? Mathf.Clamp01(Vector3.Dot(radialFromStart, radialMotion) / radialMotion.sqrMagnitude)
-            : 1f;
-        float fullT = motion.sqrMagnitude > epsilonSqr
-            ? Mathf.Clamp01(Vector3.Dot(samplePoint - start, motion) / motion.sqrMagnitude)
-            : radialT;
-        int sampleCount = motion.sqrMagnitude > epsilonSqr ? 8 : 1;
-        float bestDifference = float.MinValue;
-
-        for (int i = 0; i < sampleCount; i++)
-        {
-            float t = sampleCount == 1
-                ? radialT
-                : i == 0
-                    ? radialT
-                    : i == 1
-                        ? fullT
-                        : (float)(i - 1) / (sampleCount - 2);
-            Vector3 root = Vector3.Lerp(start, end, t);
-            Vector3 toSample = samplePoint - root;
-            float axial = Vector3.Dot(toSample, axis);
-            Vector3 radial = toSample - axis * axial;
-            float radialDifference = OperationCutterProfileRadialDifference(axial, radial, radius, cutterHeight, axis, operation);
-            float difference = Mathf.Min(radialDifference, Mathf.Min(axial, cutterHeight - axial));
-            bestDifference = Mathf.Max(bestDifference, difference);
-        }
-
-        return bestDifference;
-    }
-
-    private float OperationCutterProfileRadialDifference(
-        float axial,
-        Vector3 radial,
-        float radius,
-        float cutterHeight,
-        Vector3 axis,
-        GpuVisualCutOperation operation)
-    {
-        if (cutterAngularProfileAxialSampleCount >= 2 && cutterAngularProfileAngleSampleCount >= 3)
-        {
-            float radialDistance = radial.magnitude;
-            GetAngularProfileInterval(
-                axial,
-                radial,
-                radius,
-                cutterHeight,
-                axis,
-                new Vector3(operation.profileMeta.y, operation.profileMeta.z, operation.profileMeta.w),
-                out float minRadius,
-                out float maxRadius);
-            if (maxRadius > 0.000001f)
+            for (int i = 0; i < count; i++)
             {
-                return maxRadius - radialDistance;
+                float value = nativeCutDetailBatchValues[i];
+                nativeCutDetailValues[destinationStart + i] =
+                    float.IsNaN(value) || float.IsInfinity(value)
+                        ? NativeCutDetailAirValue
+                        : Mathf.Clamp(value, NativeCutDetailAirValue, 1000000f);
             }
 
-            return -1000000f;
+            return true;
         }
-
-        return OperationCutterProfileRadius(axial, radius, cutterHeight, operation) - radial.magnitude;
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native cut detail sampling failed: {ex.Message}", this);
+            sdfNativeReady = false;
+            ClearNativeCutDetailDisplay(false);
+            return false;
+        }
     }
 
-    private void GetAngularProfileInterval(
-        float axial,
-        Vector3 radial,
-        float radius,
-        float cutterHeight,
-        Vector3 axis,
-        Vector3 right,
-        out float minRadius,
-        out float maxRadius)
+    private void UploadNativeCutDetailDisplay(Vector3 min, float step, Vector3Int size, int sampleCount)
     {
-        minRadius = 0f;
-        maxRadius = -1f;
-        if (cutterAngularProfileAxialSampleCount < 2 || cutterAngularProfileAngleSampleCount < 3)
+        if (sampleCount <= 0 || nativeCutDetailValues == null)
         {
             return;
         }
 
-        float normalizedHeight = Mathf.Clamp01(axial / Mathf.Max(cutterHeight, voxelSize * 0.000001f));
-        Vector3 localRight = ResolveLocalCutterRight(axis, right);
-        Vector3 forward = Vector3.Cross(axis.normalized, localRight).normalized;
-        float angle = Mathf.Atan2(Vector3.Dot(radial, forward), Vector3.Dot(radial, localRight));
-        float normalizedAngle = Mathf.Repeat(angle / (Mathf.PI * 2f), 1f);
-        float minSample = SampleAngularProfile(normalizedHeight, normalizedAngle, true);
-        float maxSample = SampleAngularProfile(normalizedHeight, normalizedAngle, false);
-        if (maxSample <= 0.000001f)
+        float[] values = new float[sampleCount];
+        System.Array.Copy(nativeCutDetailValues, values, sampleCount);
+        nativeCutDetailTiles.Add(new NativeCutDetailTile
         {
+            min = min,
+            step = Mathf.Max(0.000001f, step),
+            size = size,
+            values = values,
+            sampleCount = sampleCount
+        });
+        TrimNativeCutDetailTiles();
+        UploadNativeCutDetailCache();
+    }
+
+    private void EnsureNativeCutDetailBuffer(int requiredCapacity = 1)
+    {
+        int safeCapacity = Mathf.Max(1, requiredCapacity);
+        if (nativeCutDetailBuffer == null || nativeCutDetailBufferCapacity < safeCapacity)
+        {
+            if (nativeCutDetailBuffer != null)
+            {
+                nativeCutDetailBuffer.Release();
+            }
+
+            nativeCutDetailBufferCapacity = safeCapacity;
+            nativeCutDetailBuffer = new ComputeBuffer(nativeCutDetailBufferCapacity, sizeof(float));
+            nativeCutDetailBuffer.SetData(nativeCutDetailDummy);
+        }
+    }
+
+    private void EnsureNativeCutDetailTileBuffer(int requiredTileVectorCount = 2)
+    {
+        int safeCapacity = Mathf.Max(2, requiredTileVectorCount);
+        if (nativeCutDetailTileBuffer == null || nativeCutDetailTileBufferCapacity < safeCapacity)
+        {
+            if (nativeCutDetailTileBuffer != null)
+            {
+                nativeCutDetailTileBuffer.Release();
+            }
+
+            nativeCutDetailTileBufferCapacity = safeCapacity;
+            nativeCutDetailTileBuffer = new ComputeBuffer(nativeCutDetailTileBufferCapacity, sizeof(float) * 4);
+            nativeCutDetailTileBuffer.SetData(nativeCutDetailTileDummy);
+        }
+    }
+
+    private void UploadNativeCutDetailCache()
+    {
+        int tileCount = nativeCutDetailTiles.Count;
+        int sampleCount = CountNativeCutDetailSamples();
+        nativeCutDetailReady = tileCount > 0 && sampleCount > 0;
+        EnsureNativeCutDetailBuffer(Mathf.Max(1, sampleCount));
+        EnsureNativeCutDetailTileBuffer(Mathf.Max(2, tileCount * 2));
+
+        if (!nativeCutDetailReady)
+        {
+            nativeCutDetailBuffer.SetData(nativeCutDetailDummy);
+            nativeCutDetailTileBuffer.SetData(nativeCutDetailTileDummy);
             return;
         }
 
-        minRadius = radius * Mathf.Max(0f, minSample);
-        maxRadius = radius * Mathf.Max(maxSample, minSample);
-    }
-
-    private float SampleAngularProfile(float normalizedHeight, float normalizedAngle, bool sampleMin)
-    {
-        int axialCount = cutterAngularProfileAxialSampleCount;
-        int angleCount = cutterAngularProfileAngleSampleCount;
-        float axialPosition = Mathf.Clamp01(normalizedHeight) * (axialCount - 1);
-        int axial0 = Mathf.Min(Mathf.FloorToInt(axialPosition), axialCount - 2);
-        int axial1 = axial0 + 1;
-        float axialT = Mathf.Clamp01(axialPosition - axial0);
-        float anglePosition = Mathf.Repeat(normalizedAngle, 1f) * angleCount;
-        int angle0 = Mathf.FloorToInt(anglePosition) % angleCount;
-        int angle1 = (angle0 + 1) % angleCount;
-        float angleT = Mathf.Clamp01(anglePosition - Mathf.Floor(anglePosition));
-        float value00 = GetAngularProfileSample(axial0, angle0, sampleMin);
-        float value01 = GetAngularProfileSample(axial0, angle1, sampleMin);
-        float value10 = GetAngularProfileSample(axial1, angle0, sampleMin);
-        float value11 = GetAngularProfileSample(axial1, angle1, sampleMin);
-        float angleA = Mathf.Lerp(value00, value01, Mathf.SmoothStep(0f, 1f, angleT));
-        float angleB = Mathf.Lerp(value10, value11, Mathf.SmoothStep(0f, 1f, angleT));
-        return Mathf.Lerp(angleA, angleB, Mathf.SmoothStep(0f, 1f, axialT));
-    }
-
-    private float GetAngularProfileSample(int axialIndex, int angleIndex, bool sampleMin)
-    {
-        int index = axialIndex * cutterAngularProfileAngleSampleCount + angleIndex;
-        return sampleMin
-            ? cutterAngularProfileMinRadiusSamples[index]
-            : cutterAngularProfileMaxRadiusSamples[index];
-    }
-
-    private float OperationCutterProfileRadius(
-        float axial,
-        float radius,
-        float cutterHeight,
-        GpuVisualCutOperation operation)
-    {
-        int sampleCount = Mathf.Clamp(Mathf.RoundToInt(operation.profileMeta.x), 0, MaxCutterProfileRadiusSamples);
-        if (sampleCount >= 2)
+        if (nativeCutDetailPackedValues == null || nativeCutDetailPackedValues.Length < sampleCount)
         {
-            float normalizedHeight = Mathf.Clamp01(axial / Mathf.Max(cutterHeight, 0.000001f));
-            float samplePosition = normalizedHeight * (sampleCount - 1);
-            int sampleIndex = Mathf.Min(Mathf.FloorToInt(samplePosition), sampleCount - 2);
-            float t = Mathf.Clamp01(samplePosition - sampleIndex);
-            float radiusA = GetOperationProfileRadiusSample(operation, sampleIndex);
-            float radiusB = GetOperationProfileRadiusSample(operation, sampleIndex + 1);
-            return radius * Mathf.Lerp(radiusA, radiusB, Mathf.SmoothStep(0f, 1f, t));
+            nativeCutDetailPackedValues = new float[sampleCount];
         }
 
-        return GlobalCutterProfileRadius(axial, radius, cutterHeight);
-    }
-
-    private static float GetOperationProfileRadiusSample(GpuVisualCutOperation operation, int index)
-    {
-        if (index < 0 || index >= MaxCutterProfileRadiusSamples)
+        int tileVectorCount = tileCount * 2;
+        if (nativeCutDetailTileData == null || nativeCutDetailTileData.Length < tileVectorCount)
         {
-            return 0f;
+            nativeCutDetailTileData = new Vector4[tileVectorCount];
         }
 
-        Vector4 packed = index < 4
-            ? operation.profile0
-            : index < 8
-                ? operation.profile1
-                : index < 12
-                    ? operation.profile2
-                    : index < 16
-                        ? operation.profile3
-                        : index < 20
-                            ? operation.profile4
-                            : index < 24
-                                ? operation.profile5
-                                : index < 28
-                                    ? operation.profile6
-                                    : operation.profile7;
-        int component = index & 3;
-        return component == 0
-            ? packed.x
-            : component == 1
-                ? packed.y
-                : component == 2
-                    ? packed.z
-                    : packed.w;
-    }
-
-    private float GlobalCutterProfileRadius(float axial, float radius, float cutterHeight)
-    {
-        if (cutterProfileRadiusSampleCount >= 2)
+        int sampleOffset = 0;
+        for (int i = 0; i < tileCount; i++)
         {
-            float sampledNormalizedHeight = Mathf.Clamp01(axial / Mathf.Max(cutterHeight, voxelSize * 0.000001f));
-            float samplePosition = sampledNormalizedHeight * (cutterProfileRadiusSampleCount - 1);
-            int sampleIndex = Mathf.Min(Mathf.FloorToInt(samplePosition), cutterProfileRadiusSampleCount - 2);
-            float sampleT = Mathf.Clamp01(samplePosition - sampleIndex);
-            float sampleRadiusA = cutterProfileRadiusSamples[sampleIndex];
-            float sampleRadiusB = cutterProfileRadiusSamples[sampleIndex + 1];
-            return radius * Mathf.Lerp(sampleRadiusA, sampleRadiusB, Mathf.SmoothStep(0f, 1f, sampleT));
+            NativeCutDetailTile tile = nativeCutDetailTiles[i];
+            System.Array.Copy(tile.values, 0, nativeCutDetailPackedValues, sampleOffset, tile.sampleCount);
+            nativeCutDetailTileData[i * 2] = new Vector4(
+                tile.min.x,
+                tile.min.y,
+                tile.min.z,
+                tile.step);
+            nativeCutDetailTileData[i * 2 + 1] = new Vector4(
+                tile.size.x,
+                tile.size.y,
+                tile.size.z,
+                sampleOffset);
+            sampleOffset += tile.sampleCount;
         }
 
-        float normalizedHeight = Mathf.Clamp01(axial / Mathf.Max(cutterHeight, voxelSize * 0.000001f));
-        int segments = Mathf.Max(2, profileSegmentCount);
-        float profilePosition = normalizedHeight * segments;
-        int segment = Mathf.Min(Mathf.FloorToInt(profilePosition), segments - 1);
-        float t = Mathf.Clamp01(profilePosition - segment);
-        float innerRadius = radius * 0.6535898f;
-        float radiusA = (segment & 1) == 0 ? radius : innerRadius;
-        float radiusB = ((segment + 1) & 1) == 0 ? radius : innerRadius;
-        return Mathf.Lerp(radiusA, radiusB, Mathf.SmoothStep(0f, 1f, t));
+        nativeCutDetailBuffer.SetData(nativeCutDetailPackedValues, 0, 0, sampleCount);
+        nativeCutDetailTileBuffer.SetData(nativeCutDetailTileData, 0, 0, tileVectorCount);
+    }
+
+    private void TrimNativeCutDetailTiles()
+    {
+        int maxTiles = Mathf.Max(1, maxNativeCutDetailTiles);
+        int maxSamples = Mathf.Max(4096, maxNativeCutDetailCachedSamples);
+        while (nativeCutDetailTiles.Count > maxTiles ||
+               (nativeCutDetailTiles.Count > 0 && CountNativeCutDetailSamples() > maxSamples))
+        {
+            nativeCutDetailTiles.RemoveAt(0);
+        }
+    }
+
+    private int CountNativeCutDetailSamples()
+    {
+        int count = 0;
+        for (int i = 0; i < nativeCutDetailTiles.Count; i++)
+        {
+            count += Mathf.Max(0, nativeCutDetailTiles[i].sampleCount);
+        }
+
+        return count;
+    }
+
+    private void RemoveNativeCutDetailTilesOverlapping(Vector3 localBoundsMin, Vector3 localBoundsMax)
+    {
+        bool removed = false;
+        for (int i = nativeCutDetailTiles.Count - 1; i >= 0; i--)
+        {
+            if (NativeCutDetailTileOverlaps(nativeCutDetailTiles[i], localBoundsMin, localBoundsMax))
+            {
+                nativeCutDetailTiles.RemoveAt(i);
+                removed = true;
+            }
+        }
+
+        if (removed)
+        {
+            UploadNativeCutDetailCache();
+        }
+    }
+
+    private static bool NativeCutDetailTileOverlaps(NativeCutDetailTile tile, Vector3 boundsMin, Vector3 boundsMax)
+    {
+        Vector3 tileMax = tile.min + new Vector3(
+            Mathf.Max(0, tile.size.x - 1),
+            Mathf.Max(0, tile.size.y - 1),
+            Mathf.Max(0, tile.size.z - 1)) * tile.step;
+        return AabbOverlaps(tile.min, tileMax, boundsMin, boundsMax);
+    }
+
+    private void ClearNativeCutDetailDisplay(bool releaseBuffer)
+    {
+        nativeCutDetailReady = false;
+        nativeCutDetailTiles.Clear();
+        if (releaseBuffer)
+        {
+            if (nativeCutDetailBuffer != null)
+            {
+                nativeCutDetailBuffer.Release();
+                nativeCutDetailBuffer = null;
+            }
+
+            nativeCutDetailBufferCapacity = 0;
+            if (nativeCutDetailTileBuffer != null)
+            {
+                nativeCutDetailTileBuffer.Release();
+                nativeCutDetailTileBuffer = null;
+            }
+
+            nativeCutDetailTileBufferCapacity = 0;
+        }
+        else
+        {
+            if (nativeCutDetailBuffer != null)
+            {
+                nativeCutDetailBuffer.SetData(nativeCutDetailDummy);
+            }
+
+            if (nativeCutDetailTileBuffer != null)
+            {
+                nativeCutDetailTileBuffer.SetData(nativeCutDetailTileDummy);
+            }
+        }
+    }
+
+    private void CancelNativeCutDetailRebuild()
+    {
+        nativeCutDetailRequestVersion++;
+        if (nativeCutDetailCoroutine != null)
+        {
+            StopCoroutine(nativeCutDetailCoroutine);
+            nativeCutDetailCoroutine = null;
+        }
     }
 
     private static bool AabbOverlaps(Vector3 minA, Vector3 maxA, Vector3 minB, Vector3 maxB)
@@ -3459,547 +3369,8 @@ public sealed class WorkpieceVoxel : MonoBehaviour
                minA.z <= maxB.z && maxA.z >= minB.z;
     }
 
-    private bool TryCutProfileCutterSdfGpuNoReadback(
-        Vector3 localStart,
-        Vector3 localEnd,
-        Vector3 localAxis,
-        Vector3 localRight,
-        float localRadius,
-        float localHeight,
-        float updateBand,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ)
-    {
-        if (!EnsureGpuSdfResources())
-        {
-            return false;
-        }
-
-        try
-        {
-            sdfChangedCounterData[0] = 0;
-            sdfChangedCounterBuffer.SetData(sdfChangedCounterData);
-            DispatchCutProfileCutterSdfGpu(localStart, localEnd, localAxis, localRight, localRadius, localHeight, updateBand, minX, maxX, minY, maxY, minZ, maxZ);
-            return true;
-        }
-        catch (System.Exception exception)
-        {
-            Debug.LogWarning($"GPU profile cutter SDF cutting failed: {exception.Message}", this);
-            sdfGpuUnavailable = true;
-            ReleaseGpuSdfResources();
-            return false;
-        }
-    }
-
-    private bool TryCutCapsuleSdfGpuNoReadback(
-        Vector3 localStart,
-        Vector3 localEnd,
-        float localRadius,
-        float affectedRadius,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ)
-    {
-        if (!EnsureGpuSdfResources())
-        {
-            return false;
-        }
-
-        try
-        {
-            sdfChangedCounterData[0] = 0;
-            sdfChangedCounterBuffer.SetData(sdfChangedCounterData);
-            DispatchCutCapsuleSdfGpu(localStart, localEnd, localRadius, affectedRadius, minX, maxX, minY, maxY, minZ, maxZ);
-            return true;
-        }
-        catch (System.Exception exception)
-        {
-            Debug.LogWarning($"GPU SDF cutting failed: {exception.Message}", this);
-            sdfGpuUnavailable = true;
-            ReleaseGpuSdfResources();
-            return false;
-        }
-    }
-
-    private int CutCapsuleSdfCpu(
-        Vector3 localStart,
-        Vector3 localEnd,
-        float localRadius,
-        float affectedRadius,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ,
-        out Vector3 priorityPoint)
-    {
-        int changedSampleCount = 0;
-        float affectedRadiusSqr = affectedRadius * affectedRadius;
-        priorityPoint = localEnd - Vector3.up * localRadius;
-        float priorityT = -1f;
-
-        for (int x = minX; x <= maxX; x++)
-        {
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int z = minZ; z <= maxZ; z++)
-                {
-                    Vector3 samplePoint = GetSamplePointLocal(x, y, z);
-                    Vector3 closest = ClosestPointOnSegment(localStart, localEnd, samplePoint);
-                    Vector3 toSample = samplePoint - closest;
-                    if (toSample.sqrMagnitude > affectedRadiusSqr)
-                    {
-                        continue;
-                    }
-
-                    float cutterDifference = localRadius - toSample.magnitude;
-                    float oldValue = sdfSamples[x, y, z];
-                    float newValue = Mathf.Max(oldValue, cutterDifference);
-
-                    if (newValue > oldValue + SdfChangeEpsilon)
-                    {
-                        sdfSamples[x, y, z] = newValue;
-                        changedSampleCount++;
-
-                        float segmentT = GetSegmentT(localStart, localEnd, samplePoint);
-                        if (segmentT > priorityT)
-                        {
-                            priorityT = segmentT;
-                            priorityPoint = samplePoint;
-                        }
-                    }
-                }
-            }
-        }
-
-        return changedSampleCount;
-    }
-
-    private bool TryCutCapsuleSdfGpu(
-        Vector3 localStart,
-        Vector3 localEnd,
-        float localRadius,
-        float affectedRadius,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ,
-        out int changedSampleCount,
-        out Vector3 priorityPoint)
-    {
-        changedSampleCount = 0;
-        priorityPoint = localEnd - Vector3.up * localRadius;
-
-        if (!EnsureGpuSdfResources())
-        {
-            return false;
-        }
-
-        try
-        {
-            sdfChangedCounterData[0] = 0;
-            sdfChangedCounterBuffer.SetData(sdfChangedCounterData);
-
-            DispatchCutCapsuleSdfGpu(localStart, localEnd, localRadius, affectedRadius, minX, maxX, minY, maxY, minZ, maxZ);
-
-            sdfChangedCounterBuffer.GetData(sdfChangedCounterData);
-            changedSampleCount = Mathf.Max(0, sdfChangedCounterData[0]);
-            if (changedSampleCount > 0)
-            {
-                EnsureSdfLinearSamples();
-                sdfSampleBuffer.GetData(sdfLinearSamples);
-                CopyLinearToSdfSamples();
-                priorityPoint = FindSdfCutPriorityPoint(localStart, localEnd, localRadius, minX, maxX, minY, maxY, minZ, maxZ);
-            }
-
-            return true;
-        }
-        catch (System.Exception exception)
-        {
-            Debug.LogWarning($"GPU SDF cutting failed, falling back to CPU: {exception.Message}", this);
-            sdfGpuUnavailable = true;
-            ReleaseGpuSdfResources();
-            return false;
-        }
-    }
-
-    private void DispatchCutCapsuleSdfGpu(
-        Vector3 localStart,
-        Vector3 localEnd,
-        float localRadius,
-        float affectedRadius,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ)
-    {
-        sdfCutCompute.SetBuffer(sdfCutKernel, "_SdfSamples", sdfSampleBuffer);
-        sdfCutCompute.SetBuffer(sdfCutKernel, "_ChangedCounter", sdfChangedCounterBuffer);
-        sdfCutCompute.SetInts("_MinIndex", minX, minY, minZ);
-        sdfCutCompute.SetInts("_MaxIndexExclusive", maxX + 1, maxY + 1, maxZ + 1);
-        sdfCutCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
-        sdfCutCompute.SetVector("_GridMin", GetLocalMin());
-        sdfCutCompute.SetVector("_LocalStart", localStart);
-        sdfCutCompute.SetVector("_LocalEnd", localEnd);
-        sdfCutCompute.SetFloat("_VoxelSize", voxelSize);
-        sdfCutCompute.SetFloat("_LocalRadius", localRadius);
-        sdfCutCompute.SetFloat("_AffectedRadiusSqr", affectedRadius * affectedRadius);
-        sdfCutCompute.SetFloat("_ChangeEpsilon", SdfChangeEpsilon);
-
-        int threadGroupsX = Mathf.CeilToInt((maxX - minX + 1) / 8f);
-        int threadGroupsY = Mathf.CeilToInt((maxY - minY + 1) / 8f);
-        int threadGroupsZ = Mathf.CeilToInt((maxZ - minZ + 1) / 4f);
-        sdfCutCompute.Dispatch(sdfCutKernel, threadGroupsX, threadGroupsY, threadGroupsZ);
-    }
-
-    private void DispatchCutProfileCutterSdfGpu(
-        Vector3 localStart,
-        Vector3 localEnd,
-        Vector3 localAxis,
-        Vector3 localRight,
-        float localRadius,
-        float localHeight,
-        float updateBand,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ)
-    {
-        sdfCutCompute.SetBuffer(sdfProfileCutterKernel, "_SdfSamples", sdfSampleBuffer);
-        sdfCutCompute.SetBuffer(sdfProfileCutterKernel, "_ChangedCounter", sdfChangedCounterBuffer);
-        sdfCutCompute.SetInts("_MinIndex", minX, minY, minZ);
-        sdfCutCompute.SetInts("_MaxIndexExclusive", maxX + 1, maxY + 1, maxZ + 1);
-        sdfCutCompute.SetInts("_SampleSize", SampleWidth, SampleHeight, SampleDepth);
-        sdfCutCompute.SetVector("_GridMin", GetLocalMin());
-        sdfCutCompute.SetVector("_LocalStart", localStart);
-        sdfCutCompute.SetVector("_LocalEnd", localEnd);
-        sdfCutCompute.SetVector("_CutterAxis", localAxis.normalized);
-        sdfCutCompute.SetVector("_CutterRight", ResolveLocalCutterRight(localAxis, localRight));
-        sdfCutCompute.SetFloat("_VoxelSize", voxelSize);
-        sdfCutCompute.SetFloat("_LocalRadius", localRadius);
-        sdfCutCompute.SetFloat("_CutterHeight", localHeight);
-        sdfCutCompute.SetFloat("_CutBand", updateBand);
-        sdfCutCompute.SetFloat("_AffectedRadiusSqr", (localRadius + updateBand) * (localRadius + updateBand));
-        sdfCutCompute.SetFloat("_ChangeEpsilon", SdfChangeEpsilon);
-        sdfCutCompute.SetInt("_ProfileSegmentCount", profileSegmentCount);
-        sdfCutCompute.SetInt("_ProfileRadiusSampleCount", cutterProfileRadiusSampleCount);
-        sdfCutCompute.SetFloats("_ProfileRadiusSamples", cutterProfileRadiusSamples);
-        sdfCutCompute.SetInt("_AngularProfileAxialSampleCount", cutterAngularProfileAxialSampleCount);
-        sdfCutCompute.SetInt("_AngularProfileAngleSampleCount", cutterAngularProfileAngleSampleCount);
-        sdfCutCompute.SetFloats("_AngularProfileMinRadiusSamples", cutterAngularProfileMinRadiusSamples);
-        sdfCutCompute.SetFloats("_AngularProfileMaxRadiusSamples", cutterAngularProfileMaxRadiusSamples);
-
-        int threadGroupsX = Mathf.CeilToInt((maxX - minX + 1) / 8f);
-        int threadGroupsY = Mathf.CeilToInt((maxY - minY + 1) / 8f);
-        int threadGroupsZ = Mathf.CeilToInt((maxZ - minZ + 1) / 4f);
-        sdfCutCompute.Dispatch(sdfProfileCutterKernel, threadGroupsX, threadGroupsY, threadGroupsZ);
-    }
-
-    private Vector3 FindSdfCutPriorityPoint(
-        Vector3 localStart,
-        Vector3 localEnd,
-        float localRadius,
-        int minX,
-        int maxX,
-        int minY,
-        int maxY,
-        int minZ,
-        int maxZ)
-    {
-        Vector3 priorityPoint = localEnd - Vector3.up * localRadius;
-        float priorityT = -1f;
-        float searchRadius = localRadius + voxelSize;
-        float searchRadiusSqr = searchRadius * searchRadius;
-
-        for (int x = minX; x <= maxX; x++)
-        {
-            for (int y = minY; y <= maxY; y++)
-            {
-                for (int z = minZ; z <= maxZ; z++)
-                {
-                    Vector3 samplePoint = GetSamplePointLocal(x, y, z);
-                    Vector3 closest = ClosestPointOnSegment(localStart, localEnd, samplePoint);
-                    if ((samplePoint - closest).sqrMagnitude > searchRadiusSqr)
-                    {
-                        continue;
-                    }
-
-                    float segmentT = GetSegmentT(localStart, localEnd, samplePoint);
-                    if (segmentT > priorityT)
-                    {
-                        priorityT = segmentT;
-                        priorityPoint = samplePoint;
-                    }
-                }
-            }
-        }
-
-        return priorityPoint;
-    }
-
-    private bool ShouldCleanupDetachedParts()
-    {
-        if (!removeDetachedParts || surfaceMode != WorkpieceSurfaceMode.SmoothSdf)
-        {
-            return false;
-        }
-
-        if (UsesGpuSurfaceRendering)
-        {
-            return false;
-        }
-        else if (sdfSamples == null)
-        {
-            return false;
-        }
-
-        if (!Application.isPlaying)
-        {
-            return true;
-        }
-
-        if (Time.time < nextDetachedCleanupTime)
-        {
-            return false;
-        }
-
-        nextDetachedCleanupTime = Time.time + detachedCleanupInterval;
-        return true;
-    }
-
-    private int RemoveDetachedSdfComponents()
-    {
-        int cellCount = width * height * depth;
-        EnsureConnectivityBuffers(cellCount);
-
-        connectivityQueue.Clear();
-        componentSizes.Clear();
-        componentSizes.Add(0);
-
-        for (int i = 0; i < cellCount; i++)
-        {
-            connectivityLabels[i] = 0;
-        }
-
-        for (int z = 0; z < depth; z++)
-        {
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    int index = GetCellIndex(x, y, z);
-                    connectivitySolid[index] = CellContainsSdfMaterial(x, y, z);
-                }
-            }
-        }
-
-        int componentId = 0;
-        int largestComponentId = 0;
-        int largestComponentSize = 0;
-
-        for (int z = 0; z < depth; z++)
-        {
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    int index = GetCellIndex(x, y, z);
-                    if (!connectivitySolid[index] || connectivityLabels[index] != 0)
-                    {
-                        continue;
-                    }
-
-                    componentId++;
-                    int size = FloodFillComponent(x, y, z, componentId);
-                    componentSizes.Add(size);
-
-                    if (size > largestComponentSize)
-                    {
-                        largestComponentSize = size;
-                        largestComponentId = componentId;
-                    }
-                }
-            }
-        }
-
-        if (componentId <= 1 || largestComponentId == 0)
-        {
-            return 0;
-        }
-
-        int removedCells = 0;
-        int minRemovedX = width;
-        int minRemovedY = height;
-        int minRemovedZ = depth;
-        int maxRemovedX = -1;
-        int maxRemovedY = -1;
-        int maxRemovedZ = -1;
-
-        for (int z = 0; z < depth; z++)
-        {
-            for (int y = 0; y < height; y++)
-            {
-                for (int x = 0; x < width; x++)
-                {
-                    int index = GetCellIndex(x, y, z);
-                    if (!connectivitySolid[index] || connectivityLabels[index] == largestComponentId)
-                    {
-                        continue;
-                    }
-
-                    CarveCellToAir(x, y, z);
-                    removedCells++;
-
-                    minRemovedX = Mathf.Min(minRemovedX, x);
-                    minRemovedY = Mathf.Min(minRemovedY, y);
-                    minRemovedZ = Mathf.Min(minRemovedZ, z);
-                    maxRemovedX = Mathf.Max(maxRemovedX, x);
-                    maxRemovedY = Mathf.Max(maxRemovedY, y);
-                    maxRemovedZ = Mathf.Max(maxRemovedZ, z);
-                }
-            }
-        }
-
-        if (removedCells > 0 && UsesChunkedSmoothMesh)
-        {
-            MarkDirtyCells(
-                Mathf.Max(0, minRemovedX - 1),
-                Mathf.Min(CellWidth, maxRemovedX + 2),
-                Mathf.Max(0, minRemovedY - 1),
-                Mathf.Min(CellHeight, maxRemovedY + 2),
-                Mathf.Max(0, minRemovedZ - 1),
-                Mathf.Min(CellDepth, maxRemovedZ + 2),
-                Vector3.zero);
-        }
-
-        if (removedCells > 0)
-        {
-            UploadSdfSamplesToGpu();
-        }
-
-        return removedCells;
-    }
-
-    private void EnsureConnectivityBuffers(int cellCount)
-    {
-        if (connectivitySolid == null || connectivitySolid.Length != cellCount)
-        {
-            connectivitySolid = new bool[cellCount];
-            connectivityLabels = new int[cellCount];
-        }
-    }
-
-    private int FloodFillComponent(int startX, int startY, int startZ, int componentId)
-    {
-        int startIndex = GetCellIndex(startX, startY, startZ);
-        connectivityLabels[startIndex] = componentId;
-        connectivityQueue.Enqueue(startIndex);
-
-        int size = 0;
-        while (connectivityQueue.Count > 0)
-        {
-            int index = connectivityQueue.Dequeue();
-            DecodeCellIndex(index, out int x, out int y, out int z);
-            size++;
-
-            TryVisitComponentNeighbor(x + 1, y, z, componentId);
-            TryVisitComponentNeighbor(x - 1, y, z, componentId);
-            TryVisitComponentNeighbor(x, y + 1, z, componentId);
-            TryVisitComponentNeighbor(x, y - 1, z, componentId);
-            TryVisitComponentNeighbor(x, y, z + 1, componentId);
-            TryVisitComponentNeighbor(x, y, z - 1, componentId);
-        }
-
-        return size;
-    }
-
-    private void TryVisitComponentNeighbor(int x, int y, int z, int componentId)
-    {
-        if (!IsInside(x, y, z))
-        {
-            return;
-        }
-
-        int index = GetCellIndex(x, y, z);
-        if (!connectivitySolid[index] || connectivityLabels[index] != 0)
-        {
-            return;
-        }
-
-        connectivityLabels[index] = componentId;
-        connectivityQueue.Enqueue(index);
-    }
-
-    private bool CellContainsSdfMaterial(int x, int y, int z)
-    {
-        Vector3 center = GetVoxelCenterLocal(x, y, z, GetLocalMin());
-        if (SampleSdf(center) <= IsoLevel)
-        {
-            return true;
-        }
-
-        for (int corner = 0; corner < 8; corner++)
-        {
-            int sx = x + 1 + CubeCorners[corner, 0];
-            int sy = y + 1 + CubeCorners[corner, 1];
-            int sz = z + 1 + CubeCorners[corner, 2];
-
-            if (sdfSamples[sx, sy, sz] <= IsoLevel)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private void CarveCellToAir(int x, int y, int z)
-    {
-        float airValue = voxelSize * 1.5f;
-
-        for (int sx = x; sx <= x + 2; sx++)
-        {
-            if (sx < 0 || sx >= SampleWidth)
-            {
-                continue;
-            }
-
-            for (int sy = y; sy <= y + 2; sy++)
-            {
-                if (sy < 0 || sy >= SampleHeight)
-                {
-                    continue;
-                }
-
-                for (int sz = z; sz <= z + 2; sz++)
-                {
-                    if (sz < 0 || sz >= SampleDepth)
-                    {
-                        continue;
-                    }
-
-                    sdfSamples[sx, sy, sz] = Mathf.Max(sdfSamples[sx, sy, sz], airValue);
-                }
-            }
-        }
-    }
-
     // ========================================================================
-    // Native SDF plugin integration (Zig sdf_island_remover)
+    // Native SDF plugin integration
     // ========================================================================
 
     private void InitializeNativeSdfPlugin()
@@ -4008,9 +3379,24 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         nextNativeConnectivityCheckTime = 0f;
         nativeConnectivityDirty = false;
         nativeConnectivityInFlight = false;
+        nativeConnectivityStalled = false;
+        nativeConnectivityCheckStartTime = 0f;
+        nextNativeConnectivityStallLogTime = 0f;
+        lastNativeConnectivityDirtyTime = 0f;
+        nativeConnectivityHasRegion = false;
+        nativeOpenVdbActiveVoxelCount = 0;
 
         if (surfaceMode != WorkpieceSurfaceMode.SmoothSdf)
         {
+            return;
+        }
+
+        if (blankShape == WorkpieceBlankShape.ImportedMesh && !RefreshImportedBlankMeshFromSource())
+        {
+            ReleaseGpuSdfResources();
+            ReleaseGpuSurfaceResources();
+            sdfSamples = null;
+            Debug.LogWarning("Native SDF init aborted because the imported blank mesh is missing or outside the allowed envelope.", this);
             return;
         }
 
@@ -4018,14 +3404,51 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         {
             Vector3 min = GetLocalMin();
             Vector3 size = LocalSize;
+            int nativeBlankShape = blankShape == WorkpieceBlankShape.ImportedMesh
+                ? (int)WorkpieceBlankShape.Box
+                : (int)blankShape;
             SdfNativePlugin.sdf_plugin_init(
                 width, height, depth,
                 SampleWidth, SampleHeight, SampleDepth,
                 voxelSize,
                 min.x, min.y, min.z,
-                size.x, size.y, size.z);
+                size.x, size.y, size.z,
+                nativeBlankShape,
+                ResolveBlankInnerRadiusLocal());
             SdfNativePlugin.sdf_set_profile_segment_count(profileSegmentCount);
             sdfNativeReady = true;
+            UploadNativeProfileRadiusSamples();
+            nativeOpenVdbActiveVoxelCount = Mathf.Max(0, SdfNativePlugin.sdf_openvdb_active_voxel_count());
+            if (blankShape == WorkpieceBlankShape.ImportedMesh)
+            {
+                if (!UploadNativeBlankMesh())
+                {
+                    ReleaseGpuSdfResources();
+                    ReleaseGpuSurfaceResources();
+                    sdfSamples = null;
+                    sdfNativeReady = false;
+                    Debug.LogWarning("Native SDF init aborted because the imported blank mesh was rejected by the native kernel.", this);
+                    return;
+                }
+            }
+            else if (blankShape != WorkpieceBlankShape.Box)
+            {
+                UploadSdfFromNative();
+            }
+
+            int nativeBackend = SdfNativePlugin.sdf_get_active_compute_backend();
+            int nativeBackendCapabilities = SdfNativePlugin.sdf_get_compute_backend_capabilities();
+            UploadNativeCutterMesh();
+            Debug.Log(
+                $"Native SDF ready: plugin={SdfNativePlugin.PluginName}, " +
+                $"samples={SdfNativePlugin.sdf_get_sample_count():n0}, " +
+                $"openVdb={SdfNativePlugin.sdf_openvdb_available() != 0}, " +
+                $"computeBackend={FormatNativeComputeBackend(nativeBackend)}, " +
+                $"backendCaps=0x{nativeBackendCapabilities:X}, " +
+                $"blankShape={blankShape}, " +
+                $"workpieceActiveVoxels={nativeOpenVdbActiveVoxelCount:n0}, " +
+                $"cutterActiveVoxels={nativeCutterActiveVoxelCount:n0}.",
+                this);
         }
         catch (System.Exception ex)
         {
@@ -4053,37 +3476,179 @@ public sealed class WorkpieceVoxel : MonoBehaviour
         sdfNativeReady = false;
     }
 
-    private void NativeCutCapsule(Vector3 localStart, Vector3 localEnd, float localRadius,
-        int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
+    private bool UploadNativeBlankMesh()
     {
-        if (!sdfNativeReady)
+        if (blankShape != WorkpieceBlankShape.ImportedMesh)
+        {
+            return true;
+        }
+
+        if (!sdfNativeReady ||
+            nativeBlankMeshVertices == null ||
+            nativeBlankMeshTriangleIndices == null ||
+            nativeBlankMeshVertexCount <= 0 ||
+            nativeBlankMeshIndexCount < 3)
+        {
+            return false;
+        }
+
+        try
+        {
+            int uploaded = SdfNativePlugin.sdf_set_blank_mesh(
+                nativeBlankMeshVertices,
+                nativeBlankMeshVertexCount,
+                nativeBlankMeshTriangleIndices,
+                nativeBlankMeshIndexCount);
+            if (uploaded == 0)
+            {
+                return false;
+            }
+
+            ClearGpuVisualCuts();
+            ClearNativeCutDetailDisplay(false);
+            nativeConnectivityDirty = false;
+            nativeConnectivityInFlight = false;
+            nativeConnectivityStalled = false;
+            nativeConnectivityCheckStartTime = 0f;
+            nextNativeConnectivityStallLogTime = 0f;
+            lastNativeConnectivityDirtyTime = 0f;
+            nativeConnectivityHasRegion = false;
+            UploadSdfFromNative();
+            Debug.Log(
+                $"Native imported blank mesh uploaded: vertices={nativeBlankMeshVertexCount:n0}, " +
+                $"triangles={nativeBlankMeshIndexCount / 3:n0}, " +
+                $"meshBounds=({nativeBlankMeshLocalMin}..{nativeBlankMeshLocalMax}).",
+                this);
+            return true;
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native imported blank mesh upload failed: {ex.Message}", this);
+            sdfNativeReady = false;
+            return false;
+        }
+    }
+
+    private void UploadNativeCutterMesh()
+    {
+        nativeCutterActiveVoxelCount = 0;
+        if (!sdfNativeReady ||
+            nativeCutterMeshVertices == null ||
+            nativeCutterMeshTriangleIndices == null ||
+            nativeCutterMeshVertexCount <= 0 ||
+            nativeCutterMeshIndexCount < 3)
         {
             return;
         }
 
         try
         {
-            int changed = SdfNativePlugin.sdf_cut_capsule(
-                localStart.x, localStart.y, localStart.z,
-                localEnd.x, localEnd.y, localEnd.z,
-                localRadius,
-                minX, maxX, minY, maxY, minZ, maxZ);
-            nativeConnectivityDirty |= changed > 0;
+            float cutterVoxelSize = Mathf.Max(voxelSize * 0.25f, 0.02f);
+            int uploaded = SdfNativePlugin.sdf_set_cutter_mesh(
+                nativeCutterMeshVertices,
+                nativeCutterMeshVertexCount,
+                nativeCutterMeshTriangleIndices,
+                nativeCutterMeshIndexCount,
+                cutterVoxelSize,
+                3f);
+            nativeCutterActiveVoxelCount = uploaded != 0
+                ? Mathf.Max(1, SdfNativePlugin.sdf_get_cutter_active_voxel_count())
+                : 0;
+            if (nativeCutterActiveVoxelCount > 0)
+            {
+                Debug.Log(
+                    $"Native cutter mesh uploaded: vertices={nativeCutterMeshVertexCount:n0}, " +
+                    $"triangles={nativeCutterMeshIndexCount / 3:n0}, " +
+                    $"cutterVoxelSize={cutterVoxelSize:0.####}mm, " +
+                    $"activeVoxels={nativeCutterActiveVoxelCount:n0}, " +
+                    $"meshBounds=({nativeCutterMeshLocalMin}..{nativeCutterMeshLocalMax}).",
+                    this);
+            }
+            else
+            {
+                Debug.LogWarning(
+                    $"Native cutter mesh upload produced no cutter SDF: vertices={nativeCutterMeshVertexCount:n0}, " +
+                    $"triangles={nativeCutterMeshIndexCount / 3:n0}.",
+                    this);
+            }
         }
         catch (System.Exception ex)
         {
-            Debug.LogWarning($"Native capsule cut failed: {ex.Message}", this);
+            Debug.LogWarning($"Native cutter mesh upload failed: {ex.Message}", this);
+            nativeCutterActiveVoxelCount = 0;
             sdfNativeReady = false;
         }
     }
 
-    private void NativeCutProfileCutter(Vector3 localStart, Vector3 localEnd, Vector3 localAxis,
+    private int NativeCutSelectedCutter(Vector3 localStart, Vector3 localEnd, Vector3 localAxis, Vector3 localRight,
         float localRadius, float localHeight, float updateBand,
         int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
     {
         if (!sdfNativeReady)
         {
-            return;
+            return 0;
+        }
+
+        try
+        {
+            Vector3 resolvedRight = ResolveLocalCutterRight(localAxis, localRight);
+            int changed = SdfNativePlugin.sdf_cut_selected_cutter(
+                localStart.x, localStart.y, localStart.z,
+                localEnd.x, localEnd.y, localEnd.z,
+                localAxis.x, localAxis.y, localAxis.z,
+                resolvedRight.x, resolvedRight.y, resolvedRight.z,
+                localRadius, localHeight, updateBand,
+                minX, maxX, minY, maxY, minZ, maxZ);
+            if (logNativeCutDiagnostics && changed <= 0 && Application.isPlaying && Time.time >= nextNativeNoChangeLogTime)
+            {
+                nextNativeNoChangeLogTime = Time.time + 1f;
+                Debug.Log(
+                    $"Native selected cutter changed 0 samples: meshCutter={HasNativeMeshCutter}, " +
+                    $"cutterActiveVoxels={nativeCutterActiveVoxelCount:n0}, " +
+                    $"start={FormatVector(localStart)}, end={FormatVector(localEnd)}, " +
+                    $"axis={FormatVector(localAxis)}, right={FormatVector(resolvedRight)}, " +
+                    $"radius={localRadius:0.####}mm, height={localHeight:0.####}mm, " +
+                    $"voxelSize={voxelSize:0.####}mm, " +
+                    $"cutterBounds=({FormatVector(nativeCutterMeshLocalMin)}..{FormatVector(nativeCutterMeshLocalMax)}), " +
+                    $"sampleBounds=({minX}-{maxX}, {minY}-{maxY}, {minZ}-{maxZ}).",
+                    this);
+            }
+            if (changed > 0)
+            {
+                MarkNativeConnectivityDirty(minX, maxX, minY, maxY, minZ, maxZ);
+            }
+            if (logNativeCutDiagnostics && changed > 0)
+            {
+                if (Application.isPlaying && Time.time >= nextNativePositiveCutLogTime)
+                {
+                    nextNativePositiveCutLogTime = Time.time + 1f;
+                    nativeOpenVdbActiveVoxelCount = Mathf.Max(0, SdfNativePlugin.sdf_openvdb_active_voxel_count());
+                    int cutOperationCount = Mathf.Max(0, SdfNativePlugin.sdf_get_cut_operation_count());
+                    Debug.Log(
+                        $"Native selected cutter changed {changed:n0} samples: " +
+                        $"workpieceActiveVoxels={nativeOpenVdbActiveVoxelCount:n0}, " +
+                        $"cutOperations={cutOperationCount:n0}, " +
+                        $"sampleBounds=({minX}-{maxX}, {minY}-{maxY}, {minZ}-{maxZ}).",
+                        this);
+                }
+            }
+            return changed;
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"Native profile cutter cut failed: {ex.Message}", this);
+            sdfNativeReady = false;
+            return 0;
+        }
+    }
+
+    private int NativeCutProfileCutter(Vector3 localStart, Vector3 localEnd, Vector3 localAxis,
+        float localRadius, float localHeight, float updateBand,
+        int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
+    {
+        if (!sdfNativeReady)
+        {
+            return 0;
         }
 
         try
@@ -4094,63 +3659,236 @@ public sealed class WorkpieceVoxel : MonoBehaviour
                 localAxis.x, localAxis.y, localAxis.z,
                 localRadius, localHeight, updateBand,
                 minX, maxX, minY, maxY, minZ, maxZ);
-            nativeConnectivityDirty |= changed > 0;
+            if (logNativeCutDiagnostics && changed <= 0 && Application.isPlaying && Time.time >= nextNativeNoChangeLogTime)
+            {
+                nextNativeNoChangeLogTime = Time.time + 1f;
+                Debug.Log(
+                    $"Native profile cutter changed 0 samples: start={FormatVector(localStart)}, " +
+                    $"end={FormatVector(localEnd)}, axis={FormatVector(localAxis)}, " +
+                    $"radius={localRadius:0.####}mm, height={localHeight:0.####}mm, " +
+                    $"voxelSize={voxelSize:0.####}mm, " +
+                    $"sampleBounds=({minX}-{maxX}, {minY}-{maxY}, {minZ}-{maxZ}).",
+                    this);
+            }
+
+            if (changed > 0)
+            {
+                MarkNativeConnectivityDirty(minX, maxX, minY, maxY, minZ, maxZ);
+            }
+            if (logNativeCutDiagnostics && changed > 0 &&
+                Application.isPlaying && Time.time >= nextNativePositiveCutLogTime)
+            {
+                nextNativePositiveCutLogTime = Time.time + 1f;
+                nativeOpenVdbActiveVoxelCount = Mathf.Max(0, SdfNativePlugin.sdf_openvdb_active_voxel_count());
+                Debug.Log(
+                    $"Native profile cutter changed {changed:n0} samples: " +
+                    $"workpieceActiveVoxels={nativeOpenVdbActiveVoxelCount:n0}, " +
+                    $"sampleBounds=({minX}-{maxX}, {minY}-{maxY}, {minZ}-{maxZ}).",
+                    this);
+            }
+
+            return changed;
         }
         catch (System.Exception ex)
         {
             Debug.LogWarning($"Native profile cutter cut failed: {ex.Message}", this);
             sdfNativeReady = false;
+            return 0;
         }
     }
 
     private void PollNativeConnectivity()
     {
-        if (!sdfNativeReady || !removeDetachedParts ||
-            !UsesGpuSurfaceRendering || useExpandedDisplayBounds)
+        if (!sdfNativeReady ||
+            !removeDetachedParts ||
+            !automaticDetachedCleanup ||
+            surfaceMode != WorkpieceSurfaceMode.SmoothSdf)
         {
             return;
         }
 
-        if (nativeConnectivityInFlight && SdfNativePlugin.sdf_is_connectivity_ready() != 0)
+        if (nativeConnectivityInFlight)
         {
-            if (SdfNativePlugin.sdf_get_connectivity_result() != 0)
+            if (nativeConnectivityStalled &&
+                Application.isPlaying &&
+                Time.time < nextNativeConnectivityCheckTime)
             {
-                int removed = SdfNativePlugin.sdf_apply_removal();
+                return;
+            }
+
+            int removed = SdfNativePlugin.sdf_try_apply_connectivity_cleanup();
+            if (removed >= 0)
+            {
+                int componentCount = SdfNativePlugin.sdf_get_last_connectivity_component_count();
+                int keepCoreCount = SdfNativePlugin.sdf_get_last_connectivity_keep_core_count();
+                int removalCandidateCount = SdfNativePlugin.sdf_get_last_connectivity_removal_candidate_count();
                 if (removed > 0)
                 {
+                    ClearGpuVisualCuts();
+                    ClearNativeCutDetailDisplay(false);
                     UploadSdfFromNative();
+                    RequestRebuildMesh();
                     Debug.Log($"DETACHED_CLEANUP nativeRemovedCells={removed}", this);
                 }
-            }
-            else
-            {
-                SdfNativePlugin.sdf_consume_connectivity_result();
-            }
 
-            nativeConnectivityInFlight = false;
+                Debug.Log(
+                    $"DETACHED_CLEANUP_RESULT check={nativeConnectivityCheckSerial} " +
+                    $"components={componentCount} keepCore={keepCoreCount} " +
+                    $"removalCandidates={removalCandidateCount} removed={removed} " +
+                    $"plugin={SdfNativePlugin.PluginName}",
+                    this);
 
-            // If cutting continued while the snapshot was being analyzed,
-            // immediately analyze the newest state instead of waiting another interval.
-            if (nativeConnectivityDirty)
+                nativeConnectivityInFlight = false;
+                nativeConnectivityStalled = false;
+
+                if (removed > 0)
+                {
+                    nativeConnectivityDirty = true;
+                    nextNativeConnectivityCheckTime = Application.isPlaying
+                        ? Time.time + NativeConnectivityDelay()
+                        : 0f;
+                }
+                else if (nativeConnectivityDirty)
+                {
+                    nextNativeConnectivityCheckTime = Application.isPlaying
+                        ? Time.time + NativeConnectivityDelay()
+                        : 0f;
+                }
+                else
+                {
+                    nativeConnectivityHasRegion = false;
+                }
+            }
+            else if (Application.isPlaying &&
+                Time.time - nativeConnectivityCheckStartTime > 0.75f)
             {
-                nextNativeConnectivityCheckTime = 0f;
+                nativeConnectivityStalled = true;
+                nextNativeConnectivityCheckTime = Time.time + 0.25f;
+                if (Time.time >= nextNativeConnectivityStallLogTime)
+                {
+                    nextNativeConnectivityStallLogTime = Time.time + 1f;
+                    Debug.LogWarning(
+                        $"DETACHED_CLEANUP_STALLED check={nativeConnectivityCheckSerial} " +
+                        $"elapsed={Time.time - nativeConnectivityCheckStartTime:0.###}s " +
+                        $"region={nativeConnectivityHasRegion} " +
+                        $"bounds=({nativeConnectivityMinX}-{nativeConnectivityMaxX}, " +
+                        $"{nativeConnectivityMinY}-{nativeConnectivityMaxY}, " +
+                        $"{nativeConnectivityMinZ}-{nativeConnectivityMaxZ})",
+                        this);
+                }
             }
         }
 
         if (!nativeConnectivityInFlight &&
+            !nativeConnectivityStalled &&
             nativeConnectivityDirty &&
-            (!Application.isPlaying || Time.time >= nextNativeConnectivityCheckTime))
+            (!Application.isPlaying ||
+             (Time.time >= nextNativeConnectivityCheckTime &&
+              Time.time - lastNativeConnectivityDirtyTime >= NativeConnectivityIdleDelaySeconds)))
         {
-            SdfNativePlugin.sdf_check_connectivity();
+            nativeConnectivityCheckSerial++;
+            int padding = 32;
+            if (nativeConnectivityHasRegion)
+            {
+                SdfNativePlugin.sdf_check_connectivity_region(
+                    nativeConnectivityMinX,
+                    nativeConnectivityMaxX,
+                    nativeConnectivityMinY,
+                    nativeConnectivityMaxY,
+                    nativeConnectivityMinZ,
+                    nativeConnectivityMaxZ,
+                    padding);
+            }
+            else
+            {
+                SdfNativePlugin.sdf_check_connectivity();
+            }
             nativeConnectivityInFlight = true;
+            nativeConnectivityStalled = false;
+            nativeConnectivityCheckStartTime = Application.isPlaying ? Time.time : 0f;
             nativeConnectivityDirty = false;
-            nextNativeConnectivityCheckTime = Time.time + detachedCleanupInterval;
+            nextNativeConnectivityCheckTime = Application.isPlaying
+                ? Time.time + NativeConnectivityDelay()
+                : 0f;
+            Debug.Log(
+                $"DETACHED_CLEANUP_CHECK started check={nativeConnectivityCheckSerial} " +
+                $"region={nativeConnectivityHasRegion} " +
+                $"bounds=({nativeConnectivityMinX}-{nativeConnectivityMaxX}, " +
+                $"{nativeConnectivityMinY}-{nativeConnectivityMaxY}, " +
+                $"{nativeConnectivityMinZ}-{nativeConnectivityMaxZ}) padding={padding}",
+                this);
         }
+    }
+
+    private void MarkNativeConnectivityDirty()
+    {
+        bool wasDirty = nativeConnectivityDirty;
+        nativeConnectivityDirty = true;
+        lastNativeConnectivityDirtyTime = Application.isPlaying ? Time.time : 0f;
+        nextNativeConnectivityCheckTime = Application.isPlaying
+            ? Time.time + NativeConnectivityDelay()
+            : 0f;
+        if (automaticDetachedCleanup && !wasDirty && !nativeConnectivityInFlight)
+        {
+            Debug.Log("DETACHED_CLEANUP_DIRTY scheduled", this);
+        }
+    }
+
+    private float NativeConnectivityDelay()
+    {
+        return Mathf.Max(detachedCleanupInterval, NativeConnectivityIdleDelaySeconds);
+    }
+
+    private void MarkNativeConnectivityDirty(int minX, int maxX, int minY, int maxY, int minZ, int maxZ)
+    {
+        minX = Mathf.Clamp(minX, 0, SampleWidth - 1);
+        maxX = Mathf.Clamp(maxX, 0, SampleWidth - 1);
+        minY = Mathf.Clamp(minY, 0, SampleHeight - 1);
+        maxY = Mathf.Clamp(maxY, 0, SampleHeight - 1);
+        minZ = Mathf.Clamp(minZ, 0, SampleDepth - 1);
+        maxZ = Mathf.Clamp(maxZ, 0, SampleDepth - 1);
+
+        if (!nativeConnectivityHasRegion)
+        {
+            nativeConnectivityMinX = minX;
+            nativeConnectivityMaxX = maxX;
+            nativeConnectivityMinY = minY;
+            nativeConnectivityMaxY = maxY;
+            nativeConnectivityMinZ = minZ;
+            nativeConnectivityMaxZ = maxZ;
+            nativeConnectivityHasRegion = true;
+        }
+        else
+        {
+            nativeConnectivityMinX = Mathf.Min(nativeConnectivityMinX, minX);
+            nativeConnectivityMaxX = Mathf.Max(nativeConnectivityMaxX, maxX);
+            nativeConnectivityMinY = Mathf.Min(nativeConnectivityMinY, minY);
+            nativeConnectivityMaxY = Mathf.Max(nativeConnectivityMaxY, maxY);
+            nativeConnectivityMinZ = Mathf.Min(nativeConnectivityMinZ, minZ);
+            nativeConnectivityMaxZ = Mathf.Max(nativeConnectivityMaxZ, maxZ);
+        }
+
+        MarkNativeConnectivityDirty();
+    }
+
+    private static string FormatVector(Vector3 value)
+    {
+        return $"({value.x:0.###}, {value.y:0.###}, {value.z:0.###})";
+    }
+
+    private static string FormatNativeComputeBackend(int backend)
+    {
+        return backend switch
+        {
+            0 => "CPU",
+            1 => "GPU",
+            _ => $"Unknown({backend})"
+        };
     }
 
     private void UploadSdfFromNative()
     {
-        if (!sdfNativeReady || sdfSampleBuffer == null)
+        if (!sdfNativeReady)
         {
             return;
         }
@@ -4160,16 +3898,34 @@ public sealed class WorkpieceVoxel : MonoBehaviour
             EnsureSdfLinearSamples();
             SdfNativePlugin.sdf_get_data(sdfLinearSamples, sdfLinearSamples.Length);
 
-            // Also update CPU sdfSamples for consistency
-            CopyLinearToSdfSamples();
+            if (sdfSamples != null)
+            {
+                CopyLinearToSdfSamples();
+            }
 
             // Upload to GPU
-            sdfSampleBuffer.SetData(sdfLinearSamples);
+            if (sdfSampleBuffer != null)
+            {
+                sdfSampleBuffer.SetData(sdfLinearSamples);
+            }
         }
         catch (System.Exception ex)
         {
             Debug.LogWarning($"Native SDF upload failed: {ex.Message}", this);
         }
+    }
+
+    private float ResolveBlankInnerRadiusLocal()
+    {
+        if (blankShape != WorkpieceBlankShape.Tube && blankShape != WorkpieceBlankShape.HalfTube)
+        {
+            return 0f;
+        }
+
+        float outerRadius = Mathf.Max(
+            voxelSize * 0.5f,
+            Mathf.Min(LocalSize.x, LocalSize.z) * 0.5f - voxelSize * 0.5f);
+        return Mathf.Clamp(blankInnerRadius, 0f, Mathf.Max(0f, outerRadius - voxelSize * 0.5f));
     }
 
     private int GetCellIndex(int x, int y, int z)
@@ -4426,31 +4182,6 @@ public sealed class WorkpieceVoxel : MonoBehaviour
 
         float t = Mathf.Clamp01((IsoLevel - valueA) / delta);
         return Vector3.LerpUnclamped(a, b, t);
-    }
-
-    private static Vector3 ClosestPointOnSegment(Vector3 a, Vector3 b, Vector3 point)
-    {
-        Vector3 segment = b - a;
-        float lengthSqr = segment.sqrMagnitude;
-        if (lengthSqr < 0.000001f)
-        {
-            return a;
-        }
-
-        float t = Vector3.Dot(point - a, segment) / lengthSqr;
-        return a + segment * Mathf.Clamp01(t);
-    }
-
-    private static float GetSegmentT(Vector3 a, Vector3 b, Vector3 point)
-    {
-        Vector3 segment = b - a;
-        float lengthSqr = segment.sqrMagnitude;
-        if (lengthSqr < 0.000001f)
-        {
-            return 1f;
-        }
-
-        return Mathf.Clamp01(Vector3.Dot(point - a, segment) / lengthSqr);
     }
 
     private void AddSmoothTriangle(Vector3 a, Vector3 b, Vector3 c)

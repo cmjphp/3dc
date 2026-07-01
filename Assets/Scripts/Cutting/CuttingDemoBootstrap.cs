@@ -1,4 +1,6 @@
+using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 public enum CuttingPrecisionStorageMode
 {
@@ -13,6 +15,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     private const string CutterResourcesFolder = "Cutting";
     private const string DefaultCutterResourcePath = "Cutting/Cutter";
     private const string ThreadMillResourcePath = "Cutting/xd_luowenxidao";
+    private static readonly Color DefaultWorkpieceColor = new Color(0.72f, 0.76f, 0.78f, 1f);
     public const float DefaultCutterDiameterMm = 6f;
     public const float DefaultCutterHeightMm = 3f;
     public const float MinWorkpieceSizeMm = 1f;
@@ -33,6 +36,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         public Vector3 modelLocalEuler = new Vector3(-90f, 0f, 0f);
         public bool normalizeModelToRadius = true;
         public bool useProfileCutter = true;
+        public bool preferNativeMeshCutter;
         [Min(2)] public int profileSegmentCount = 6;
         public Vector3 directionEuler;
         [Min(0.001f)] public float diameterMm = DefaultCutterDiameterMm;
@@ -44,20 +48,21 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     public bool skipIfWorkpieceExists = true;
     public bool useRealtimeDefaults = true;
     public bool showWorkpieceSizeUi = true;
+    public bool showMeasurementUi = true;
 
     [Header("Precision Target")]
     public bool driveGridFromPrecisionTarget = true;
-    public CuttingPrecisionStorageMode precisionStorageMode = CuttingPrecisionStorageMode.SparseBricks;
-    [Min(0.001f)] public float targetPrecisionMm = 0.01f;
+    public CuttingPrecisionStorageMode precisionStorageMode = CuttingPrecisionStorageMode.DenseWorkpiece;
+    [Min(0.001f)] public float targetPrecisionMm = 0.35f;
     public Vector3 travelEnvelopeMm = new Vector3(1000f, 1000f, 1000f);
     public Vector3 workpieceSizeMm = new Vector3(100f, 100f, 100f);
-    public Vector3 localPrecisionWindowMm = new Vector3(8f, 4f, 8f);
+    public Vector3 localPrecisionWindowMm = new Vector3(20f, 8f, 20f);
     [Min(8)] public int sparseBrickResolution = 64;
     [Min(1)] public int maxResidentSparseBricks = 4096;
     [Min(1)] public int maxResidentSparseGpuBricks = 96;
     [Min(1)] public int maxRenderedSparseGpuBricks = 96;
     [Min(1)] public int maxSparseGpuBrickCutsPerOperation = 24;
-    [Min(100000)] public int maxSdfSamples = 12000000;
+    [Min(100000)] public int maxSdfSamples = 64000000;
 
     [Header("Measurement")]
     [Min(0.0001f)] public float measurementPrecisionMm = 0.001f;
@@ -71,6 +76,9 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     public int height = 50;
     public int depth = 77;
     public float voxelSize = 0.025f;
+    public WorkpieceBlankShape blankShape = WorkpieceBlankShape.Box;
+    [Min(0f)] public float blankInnerRadiusMm = 20f;
+    public GameObject importedBlankModelRoot;
     public WorkpieceSurfaceMode surfaceMode = WorkpieceSurfaceMode.SmoothSdf;
     public bool updateCollider;
     [Min(100)] public int smoothRebuildCellsPerFrame = 2500;
@@ -82,10 +90,11 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     [Min(1)] public int immediateChunkRebuildLimit = 12;
     public bool removeDetachedParts = true;
     [Min(0.01f)] public float detachedCleanupInterval = 0.08f;
-    public bool useGpuDetachedCleanup;
-    [Min(0.25f)] public float gpuDetachedAirValueVoxels = 1.5f;
-    public bool useGpuSdfCutting;
+    [UnityEngine.Serialization.FormerlySerializedAs("useGpuSdfCutting")]
+    public bool useGpuSdfDisplayBuffer;
     public bool useGpuSurfaceRendering = true;
+    public bool useGpuVisualCutPreview;
+    public bool useNativeCutDetailDisplay;
     [Min(10000)] public int maxGpuTriangles = 1000000;
     [Min(16)] public int gpuRaymarchMaxSteps = 192;
     [Range(0.25f, 2f)] public float gpuRaymarchStepScale = 0.75f;
@@ -100,6 +109,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     public bool keepCutterVisible = true;
     [Min(1f)] public float minimumCutterVisualPixels = 14f;
     public bool useProfileCutter = true;
+    public bool preferNativeMeshCutter;
     [Min(2)] public int cutterProfileSegmentCount = 6;
     public Vector3 cutterDirectionEuler;
     [Min(0.001f)] public float cutterHeightScale =
@@ -109,7 +119,10 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
     [Min(0.001f)] public float cutterMoveSpeedMmPerSecond = 50f;
     [Min(0.001f)] public float cutterVerticalSpeedMmPerSecond = 20f;
     [Min(1f)] public float cutterShiftMultiplier = 3f;
-    [Min(0f)] public float initialCutDepthMm = 0.5f;
+    [Min(0f)] public float initialCutDepthMm = 2f;
+
+    [Header("Diagnostics")]
+    public bool logCutDiagnostics;
 
     [Header("Cutter Library")]
     public int selectedCutterToolIndex;
@@ -159,7 +172,6 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         if (skipIfWorkpieceExists && existingWorkpiece != null)
         {
             ApplyWorkpieceSettings(existingWorkpiece);
-            ConfigureSparseHistory(existingWorkpiece.gameObject);
             existingWorkpiece.ResetWorkpiece();
             ConfigureExistingCutter(existingWorkpiece);
             ConfigureCamera(existingWorkpiece);
@@ -178,14 +190,14 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         // explicit startup default; runtime UI changes remain dynamic because
         // SetCutterParameters does not call this startup initializer again.
         driveGridFromPrecisionTarget = true;
-        precisionStorageMode = CuttingPrecisionStorageMode.SparseBricks;
-        targetPrecisionMm = 0.01f;
+        precisionStorageMode = CuttingPrecisionStorageMode.DenseWorkpiece;
+        targetPrecisionMm = 0.35f;
         sparseBrickResolution = 64;
         maxResidentSparseBricks = 4096;
         maxResidentSparseGpuBricks = 96;
         maxRenderedSparseGpuBricks = 96;
         maxSparseGpuBrickCutsPerOperation = 24;
-        maxSdfSamples = 12000000;
+        maxSdfSamples = 64000000;
         measurementPrecisionMm = 0.001f;
         defaultMeasurementMaxDistanceMm = 1500f;
         measurementMaxMarchStepMm = 1f;
@@ -203,13 +215,13 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         immediateChunkRebuildLimit = 12;
         removeDetachedParts = true;
         detachedCleanupInterval = 0.08f;
-        useGpuDetachedCleanup = false;
-        gpuDetachedAirValueVoxels = 1.5f;
-        useGpuSdfCutting = false;
+        useGpuSdfDisplayBuffer = false;
         useGpuSurfaceRendering = true;
+        useGpuVisualCutPreview = false;
+        useNativeCutDetailDisplay = false;
         maxGpuTriangles = 1000000;
-        gpuRaymarchMaxSteps = Mathf.Max(gpuRaymarchMaxSteps, 384);
-        gpuRaymarchStepScale = 0.65f;
+        gpuRaymarchMaxSteps = Mathf.Max(gpuRaymarchMaxSteps, 512);
+        gpuRaymarchStepScale = 0.5f;
         cutterModelLocalEuler = new Vector3(-90f, 0f, 0f);
         normalizeCutterModelToRadius = true;
         keepCutterVisible = true;
@@ -220,11 +232,12 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cutterRadius = DefaultCutterDiameterMm * 0.5f;
         cutterHeightScale = DefaultCutterHeightMm / cutterRadius;
         EnsureCutterToolLibrary();
+        selectedCutterToolIndex = 0;
         ApplyCutterToolPreset(selectedCutterToolIndex, false);
         cutterMoveSpeedMmPerSecond = 50f;
         cutterVerticalSpeedMmPerSecond = 20f;
         cutterShiftMultiplier = 3f;
-        initialCutDepthMm = 0.5f;
+        initialCutDepthMm = 2f;
     }
 
     private void ApplyPrecisionTarget()
@@ -253,7 +266,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         if (precisionStorageMode == CuttingPrecisionStorageMode.DenseWorkpiece && fullDenseSampleCount > safeMaxSamples)
         {
             Debug.LogWarning(
-                $"Dense 0.01mm-class SDF for {fullSize.x:0.###}x{fullSize.y:0.###}x{fullSize.z:0.###}mm " +
+                $"Dense {requestedVoxelSize:0.####}mm SDF for {fullSize.x:0.###}x{fullSize.y:0.###}x{fullSize.z:0.###}mm " +
                 $"would need {fullDenseSampleCount:n0} samples. Use LocalPrecisionWindow or sparse bricks for long travel.");
         }
 
@@ -331,7 +344,6 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         }
 
         ApplyWorkpieceSettings(workpiece);
-        ConfigureSparseHistory(workpiece.gameObject);
         workpiece.ResetWorkpiece();
         ConfigureExistingCutter(workpiece);
         ConfigureCamera(workpiece);
@@ -473,6 +485,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             modelLocalEuler = new Vector3(-90f, 0f, 0f),
             normalizeModelToRadius = true,
             useProfileCutter = true,
+            preferNativeMeshCutter = false,
             profileSegmentCount = 6,
             directionEuler = Vector3.zero,
             diameterMm = DefaultCutterDiameterMm,
@@ -496,6 +509,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             modelLocalEuler = modelEuler,
             normalizeModelToRadius = true,
             useProfileCutter = true,
+            preferNativeMeshCutter = true,
             profileSegmentCount = 24,
             directionEuler = Vector3.zero,
             diameterMm = DefaultCutterDiameterMm,
@@ -512,6 +526,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             modelLocalEuler = new Vector3(-90f, 0f, 0f),
             normalizeModelToRadius = true,
             useProfileCutter = true,
+            preferNativeMeshCutter = false,
             profileSegmentCount = 6,
             directionEuler = Vector3.zero,
             diameterMm = DefaultCutterDiameterMm,
@@ -567,6 +582,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             modelLocalEuler = modelEuler,
             normalizeModelToRadius = true,
             useProfileCutter = true,
+            preferNativeMeshCutter = true,
             profileSegmentCount = 24,
             directionEuler = Vector3.zero,
             diameterMm = diameterMm,
@@ -604,6 +620,11 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         if (!isDefaultModel && preset.profileSegmentCount == 6)
         {
             preset.profileSegmentCount = 24;
+        }
+
+        if (!isDefaultModel)
+        {
+            preset.preferNativeMeshCutter = true;
         }
     }
 
@@ -776,6 +797,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cutterModelLocalEuler = preset.modelLocalEuler;
         normalizeCutterModelToRadius = preset.normalizeModelToRadius;
         useProfileCutter = preset.useProfileCutter;
+        preferNativeMeshCutter = preset.preferNativeMeshCutter;
         cutterProfileSegmentCount = Mathf.Max(2, preset.profileSegmentCount);
         cutterDirectionEuler = SanitizeCutterDirectionEuler(preset.directionEuler);
 
@@ -829,11 +851,10 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         MeshRenderer renderer = workpieceObject.AddComponent<MeshRenderer>();
         renderer.sharedMaterial = workpieceMaterial != null
             ? workpieceMaterial
-            : CreateCompatibleMaterial("Voxel Workpiece Material", new Color(0.72f, 0.76f, 0.78f, 1f));
+            : CreateCompatibleMaterial("Voxel Workpiece Material", DefaultWorkpieceColor);
 
         WorkpieceVoxel workpiece = workpieceObject.AddComponent<WorkpieceVoxel>();
         ApplyWorkpieceSettings(workpiece);
-        ConfigureSparseHistory(workpieceObject);
         workpiece.initializeOnStart = false;
         workpiece.ResetWorkpiece();
 
@@ -847,6 +868,9 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         workpiece.depth = Mathf.Max(1, depth);
         workpiece.voxelSize = Mathf.Max(0.001f, voxelSize);
         workpiece.maxAllocatedSdfSamples = Mathf.Max(100000, maxSdfSamples);
+        workpiece.blankShape = blankShape;
+        workpiece.blankInnerRadius = Mathf.Max(0f, blankInnerRadiusMm);
+        workpiece.importedBlankMeshRoot = importedBlankModelRoot;
         workpiece.surfaceMode = surfaceMode;
         workpiece.asyncSmoothMeshRebuild = true;
         workpiece.smoothRebuildCellsPerFrame = Mathf.Max(100, smoothRebuildCellsPerFrame);
@@ -858,10 +882,14 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         workpiece.immediateChunkRebuildLimit = Mathf.Max(1, immediateChunkRebuildLimit);
         workpiece.removeDetachedParts = removeDetachedParts;
         workpiece.detachedCleanupInterval = Mathf.Max(0.01f, detachedCleanupInterval);
-        workpiece.useGpuDetachedCleanup = useGpuDetachedCleanup;
-        workpiece.gpuDetachedAirValueVoxels = Mathf.Max(0.25f, gpuDetachedAirValueVoxels);
-        workpiece.useGpuSdfCutting = useGpuSdfCutting;
+        workpiece.useGpuSdfDisplayBuffer = useGpuSdfDisplayBuffer;
         workpiece.useGpuSurfaceRendering = useGpuSurfaceRendering;
+        workpiece.useGpuVisualCutPreview = useGpuVisualCutPreview;
+        workpiece.useNativeCutDetailDisplay = useNativeCutDetailDisplay;
+        workpiece.gpuSurfaceColor = DefaultWorkpieceColor;
+        workpiece.logNativeCutDiagnostics = logCutDiagnostics;
+        workpiece.ClearDisplayOverlays();
+        ApplyDefaultWorkpieceMaterial(workpiece);
         Vector3 detailSize = new Vector3(workpiece.width, workpiece.height, workpiece.depth) * workpiece.voxelSize;
         Vector3 displaySize = SanitizeWorkpieceSize(workpieceSizeMm);
         workpiece.useExpandedDisplayBounds = precisionStorageMode != CuttingPrecisionStorageMode.DenseWorkpiece;
@@ -873,54 +901,62 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         workpiece.updateCollider = updateCollider;
         workpiece.initializeOnStart = false;
         workpiece.SetProfileSegmentCount(cutterProfileSegmentCount);
+        ConfigureWorkpieceMeasurement(workpiece);
     }
 
-    private void ConfigureSparseHistory(GameObject workpieceObject)
+    private void ApplyDefaultWorkpieceMaterial(WorkpieceVoxel workpiece)
     {
-        SparseCutHistory history = workpieceObject.GetComponent<SparseCutHistory>();
-        if (precisionStorageMode != CuttingPrecisionStorageMode.SparseBricks)
+        MeshRenderer renderer = workpiece.GetComponent<MeshRenderer>();
+        if (renderer == null || workpieceMaterial != null)
         {
-            if (history != null)
+            return;
+        }
+
+        if (renderer.sharedMaterial == null)
+        {
+            renderer.sharedMaterial = CreateCompatibleMaterial("Voxel Workpiece Material", DefaultWorkpieceColor);
+            return;
+        }
+
+        SetMaterialColor(renderer.sharedMaterial, DefaultWorkpieceColor);
+    }
+
+    private void ConfigureWorkpieceMeasurement(WorkpieceVoxel workpiece)
+    {
+        WorkpieceMeasurement measurement = workpiece.GetComponent<WorkpieceMeasurement>();
+        if (measurement == null)
+        {
+            measurement = workpiece.gameObject.AddComponent<WorkpieceMeasurement>();
+        }
+
+        measurement.workpiece = workpiece;
+        measurement.measurementPrecisionMm = Mathf.Clamp(measurementPrecisionMm, 0.000001f, 0.001f);
+        measurement.defaultMaxDistanceMm = Mathf.Max(0.001f, defaultMeasurementMaxDistanceMm);
+        measurement.maxMarchStepMm = Mathf.Max(measurement.measurementPrecisionMm, measurementMaxMarchStepMm);
+        measurement.maxMarchIterations = Mathf.Max(64, maxMeasurementMarchIterations);
+        ConfigureMeasurementUi(measurement);
+    }
+
+    private void ConfigureMeasurementUi(WorkpieceMeasurement measurement)
+    {
+        WorkpieceMeasurementRuntimeUi ui = GetComponent<WorkpieceMeasurementRuntimeUi>();
+        if (!showMeasurementUi)
+        {
+            if (ui != null)
             {
-                history.enabled = false;
+                ui.enabled = false;
             }
 
             return;
         }
 
-        if (history == null)
+        if (ui == null)
         {
-            history = workpieceObject.AddComponent<SparseCutHistory>();
+            ui = gameObject.AddComponent<WorkpieceMeasurementRuntimeUi>();
         }
 
-        history.enabled = true;
-        history.precisionMm = Mathf.Max(0.001f, targetPrecisionMm);
-        Vector3 travelSize = SanitizeSize(travelEnvelopeMm);
-        Vector3 fullWorkpieceSize = SanitizeWorkpieceSize(workpieceSizeMm);
-        Vector3 detailSize = new Vector3(width, height, depth) * voxelSize;
-        Vector3 workpieceCenter = new Vector3(0f, (detailSize.y - fullWorkpieceSize.y) * 0.5f, 0f);
-        float alignedTop = workpieceCenter.y + fullWorkpieceSize.y * 0.5f;
-        history.travelEnvelopeMm = travelSize;
-        history.travelCenterMm = new Vector3(0f, alignedTop - travelSize.y * 0.5f, 0f);
-        history.workpieceSizeMm = fullWorkpieceSize;
-        history.workpieceCenterMm = workpieceCenter;
-        history.brickResolution = Mathf.Max(8, sparseBrickResolution);
-        history.maxResidentBricks = Mathf.Max(1, maxResidentSparseBricks);
-        history.maxResidentGpuBricks = Mathf.Max(1, maxResidentSparseGpuBricks);
-        history.maxRenderedGpuBricks = Mathf.Max(1, maxRenderedSparseGpuBricks);
-        history.maxGpuBrickCutsPerOperation = Mathf.Max(1, maxSparseGpuBrickCutsPerOperation);
-        history.gpuRaymarchMaxSteps = Mathf.Clamp(gpuRaymarchMaxSteps, 16, 1024);
-        history.gpuRaymarchStepScale = Mathf.Clamp(gpuRaymarchStepScale, 0.25f, 2f);
-        history.measurementPrecisionMm = Mathf.Max(0.0001f, measurementPrecisionMm);
-        history.defaultMeasurementMaxDistanceMm = Mathf.Max(1f, defaultMeasurementMaxDistanceMm);
-        history.measurementMaxMarchStepMm = Mathf.Max(0.001f, measurementMaxMarchStepMm);
-        history.maxMeasurementMarchIterations = Mathf.Max(64, maxMeasurementMarchIterations);
-        history.maxMeasurementOperationHistory = Mathf.Max(1024, maxMeasurementOperationHistory);
-        history.profileSegmentCount = Mathf.Max(2, cutterProfileSegmentCount);
-        history.useGpuBrickSdf = true;
-        history.drawGpuBricks = false;
-        history.drawDebugBricks = false;
-        history.ResetHistory();
+        ui.Configure(measurement);
+        ui.enabled = true;
     }
 
     private void CreateCutter(WorkpieceVoxel workpiece)
@@ -930,7 +966,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
 
         CutterController cutter = cutterObject.AddComponent<CutterController>();
         ConfigureCutter(cutter, workpiece);
-        cutter.PrimeCutSweepFromAutomaticEntry();
+        cutter.ResetCutSweep();
         SetupCutterVisual(cutterObject);
         RefreshCutterProfileFromVisual(cutter);
     }
@@ -947,7 +983,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         ConfigureCutter(cutter, workpiece);
         cutter.transform.position = GetCutterStartWorldPosition(workpiece);
         cutter.transform.localScale = Vector3.one;
-        cutter.PrimeCutSweepFromAutomaticEntry();
+        cutter.ResetCutSweep();
         SetupCutterVisual(cutter.gameObject);
         RefreshCutterProfileFromVisual(cutter);
     }
@@ -958,13 +994,6 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         float cutDepth = Mathf.Clamp(initialCutDepthMm, 0f, workpiece.LocalSize.y);
         localStart.y = workpiece.LocalSize.y * 0.5f - cutDepth;
         return workpiece.transform.TransformPoint(localStart);
-    }
-
-    private Vector3 GetCutterEntryWorldPosition(WorkpieceVoxel workpiece)
-    {
-        Vector3 localEntry = cutterStartPosition;
-        localEntry.y = workpiece.LocalSize.y * 0.5f + workpiece.voxelSize;
-        return workpiece.transform.TransformPoint(localEntry);
     }
 
     private void ConfigureCutter(CutterController cutter, WorkpieceVoxel workpiece)
@@ -982,12 +1011,17 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         cutter.requestMeshRebuildAfterEachCut = true;
         cutter.useProfileCutter = useProfileCutter;
         cutter.cutterHeightScale = cutterHeightScale;
-        cutter.sparseHistory = Object.FindFirstObjectByType<SparseCutHistory>();
+        cutter.logCutDiagnostics = logCutDiagnostics;
         cutter.transform.rotation = Quaternion.Euler(cutterDirectionEuler);
         cutter.autoMove = false;
         cutter.autoMoveStraightLine = true;
         cutter.autoMoveExtents = new Vector3(1.25f, 0f, 0f);
         cutter.autoMoveSpeed = 0.5f;
+        float localStepLimit = Mathf.Max(
+            workpiece.voxelSize * 4f,
+            Mathf.Min(workpiece.LocalSize.x, Mathf.Min(workpiece.LocalSize.y, workpiece.LocalSize.z)) * 0.01f);
+        cutter.maxMoveStepPerFrame = localStepLimit;
+        cutter.maxCutSweepLength = Mathf.Max(localStepLimit, workpiece.voxelSize * 8f);
         ApplyCutterProfileSettingsToScene(workpiece);
     }
 
@@ -1001,6 +1035,7 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
 
         if (workpiece != null)
         {
+            workpiece.preferNativeMeshCutter = preferNativeMeshCutter;
             workpiece.SetProfileSegmentCount(segmentCount);
             workpiece.SetProfileRadiusSamples(cutterProfileRadiusSamples, cutterProfileRadiusSampleCount);
             workpiece.SetAngularProfileRadiusSamples(
@@ -1010,14 +1045,6 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
                 cutterAngularProfileAngleSampleCount);
         }
 
-        SparseCutHistory history = workpiece != null
-            ? workpiece.GetComponent<SparseCutHistory>()
-            : Object.FindFirstObjectByType<SparseCutHistory>();
-        if (history != null)
-        {
-            history.profileSegmentCount = segmentCount;
-            history.SetProfileRadiusSamples(cutterProfileRadiusSamples, cutterProfileRadiusSampleCount);
-        }
     }
 
     private void RefreshCutterProfileFromVisual(CutterController cutter)
@@ -1036,11 +1063,12 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             cutterAngularProfileMaxRadiusSamples[i] = 0f;
         }
 
-        if (cutter != null &&
+        bool extractedProfile = cutter != null &&
             TryExtractCutterProfileRadiusSamples(
-                cutter.gameObject,
-                cutterProfileRadiusSamples,
-                out cutterProfileRadiusSampleCount))
+            cutter.gameObject,
+            cutterProfileRadiusSamples,
+            out cutterProfileRadiusSampleCount);
+        if (extractedProfile)
         {
             TryExtractCutterAngularProfileRadiusSamples(
                 cutter.gameObject,
@@ -1048,11 +1076,11 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
                 cutterAngularProfileMaxRadiusSamples,
                 out cutterAngularProfileAxialSampleCount,
                 out cutterAngularProfileAngleSampleCount);
-            ApplyCutterProfileSettingsToScene(cutter.workpiece);
-            return;
         }
 
-        ApplyCutterProfileSettingsToScene(cutter != null ? cutter.workpiece : null);
+        WorkpieceVoxel targetWorkpiece = cutter != null ? cutter.workpiece : null;
+        ApplyCutterProfileSettingsToScene(targetWorkpiece);
+        RefreshNativeCutterMeshFromVisual(cutter, targetWorkpiece);
     }
 
     private static bool TryExtractCutterProfileRadiusSamples(
@@ -1119,6 +1147,153 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
 
         sampleCount = count;
         return true;
+    }
+
+    private static bool TryExtractNativeCutterMesh(
+        GameObject cutterObject,
+        out float[] vertices,
+        out int vertexCount,
+        out int[] triangleIndices,
+        out int indexCount)
+    {
+        vertices = null;
+        triangleIndices = null;
+        vertexCount = 0;
+        indexCount = 0;
+
+        if (cutterObject == null)
+        {
+            return false;
+        }
+
+        Transform visualRoot = cutterObject.transform.Find("Cutter Visual Anchor");
+        if (visualRoot == null)
+        {
+            return false;
+        }
+
+        List<Vector3> vertexList = new List<Vector3>(4096);
+        List<int> indexList = new List<int>(8192);
+
+        MeshFilter[] filters = visualRoot.GetComponentsInChildren<MeshFilter>(true);
+        for (int i = 0; i < filters.Length; i++)
+        {
+            AccumulateNativeCutterMesh(
+                cutterObject.transform,
+                filters[i].transform,
+                filters[i].sharedMesh,
+                vertexList,
+                indexList);
+        }
+
+        SkinnedMeshRenderer[] skinnedRenderers = visualRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+        for (int i = 0; i < skinnedRenderers.Length; i++)
+        {
+            AccumulateNativeCutterMesh(
+                cutterObject.transform,
+                skinnedRenderers[i].transform,
+                skinnedRenderers[i].sharedMesh,
+                vertexList,
+                indexList);
+        }
+
+        if (vertexList.Count <= 0 || indexList.Count < 3)
+        {
+            return false;
+        }
+
+        vertexCount = vertexList.Count;
+        indexCount = indexList.Count;
+        vertices = new float[vertexCount * 3];
+        for (int i = 0; i < vertexList.Count; i++)
+        {
+            Vector3 vertex = vertexList[i];
+            int offset = i * 3;
+            vertices[offset] = vertex.x;
+            vertices[offset + 1] = vertex.y;
+            vertices[offset + 2] = vertex.z;
+        }
+
+        triangleIndices = indexList.ToArray();
+        return true;
+    }
+
+    private static void AccumulateNativeCutterMesh(
+        Transform cutterRoot,
+        Transform meshTransform,
+        Mesh mesh,
+        List<Vector3> vertices,
+        List<int> triangleIndices)
+    {
+        if (cutterRoot == null ||
+            meshTransform == null ||
+            mesh == null ||
+            !mesh.isReadable)
+        {
+            return;
+        }
+
+        Vector3[] meshVertices = mesh.vertices;
+        int baseIndex = vertices.Count;
+        for (int i = 0; i < meshVertices.Length; i++)
+        {
+            vertices.Add(cutterRoot.InverseTransformPoint(meshTransform.TransformPoint(meshVertices[i])));
+        }
+
+        for (int subMesh = 0; subMesh < mesh.subMeshCount; subMesh++)
+        {
+            if (mesh.GetTopology(subMesh) != MeshTopology.Triangles)
+            {
+                continue;
+            }
+
+            int[] indices = mesh.GetIndices(subMesh);
+            for (int i = 0; i + 2 < indices.Length; i += 3)
+            {
+                int a = indices[i];
+                int b = indices[i + 1];
+                int c = indices[i + 2];
+                if (a < 0 || b < 0 || c < 0 ||
+                    a >= meshVertices.Length || b >= meshVertices.Length || c >= meshVertices.Length)
+                {
+                    continue;
+                }
+
+                triangleIndices.Add(baseIndex + a);
+                triangleIndices.Add(baseIndex + b);
+                triangleIndices.Add(baseIndex + c);
+            }
+        }
+    }
+
+    private static void RefreshNativeCutterMeshFromVisual(
+        CutterController cutter,
+        WorkpieceVoxel targetWorkpiece)
+    {
+        WorkpieceVoxel workpiece = targetWorkpiece != null
+            ? targetWorkpiece
+            : Object.FindFirstObjectByType<WorkpieceVoxel>();
+        if (workpiece == null)
+        {
+            return;
+        }
+
+        if (cutter != null &&
+            TryExtractNativeCutterMesh(
+                cutter.gameObject,
+                out float[] vertices,
+                out int vertexCount,
+                out int[] triangleIndices,
+                out int indexCount))
+        {
+            workpiece.SetNativeCutterMesh(vertices, vertexCount, triangleIndices, indexCount);
+            return;
+        }
+
+        workpiece.ClearNativeCutterMesh();
+        Debug.LogWarning(
+            "Native cutter mesh extraction failed; selected cutter has no readable triangle mesh under Cutter Visual Anchor.",
+            workpiece);
     }
 
     private static bool TryExtractCutterAngularProfileRadiusSamples(
@@ -1852,6 +2027,17 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
             name = materialName
         };
 
+        SetMaterialColor(material, color);
+        return material;
+    }
+
+    private static void SetMaterialColor(Material material, Color color)
+    {
+        if (material == null)
+        {
+            return;
+        }
+
         if (material.HasProperty("_BaseColor"))
         {
             material.SetColor("_BaseColor", color);
@@ -1861,8 +2047,6 @@ public sealed class CuttingDemoBootstrap : MonoBehaviour
         {
             material.SetColor("_Color", color);
         }
-
-        return material;
     }
 
 #if UNITY_EDITOR
